@@ -1,10 +1,6 @@
 {
-  "functions": {
-    "src/app/api/assemble/route.js": {
-      "maxDuration": 300
-    },
-    "src/app/api/generate/route.js": {
-      "maxDuration": 300
-    }
-  }
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "buildCommand": "next build",
+  "installCommand": "npm install"
 }
