@@ -2,9 +2,10 @@ import fs from "fs/promises";
 import path from "path";
 import os from "os";
 import ffmpeg from "fluent-ffmpeg";
-import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
-
-ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+import {
+  ensureFfmpegConfigured,
+  logFfmpegError,
+} from "@/lib/pipeline/ffmpeg-check";
 
 export function probeMediaDuration(filePath) {
   return new Promise((resolve, reject) => {
@@ -83,7 +84,7 @@ function runFfmpegPrepare(
         resolve();
       })
       .on("error", (err) => {
-        console.error("[ffmpeg-prepare] Normalisation failed", err.message);
+        logFfmpegError("prepare-normalise", err, { inputPath, outputPath });
         reject(err);
       })
       .run();
@@ -101,6 +102,8 @@ export async function prepareStockClip(
   voiceDurationSeconds,
   trimStartSeconds = 0,
 ) {
+  await ensureFfmpegConfigured();
+
   const targetDuration = Math.max(0.1, Number(voiceDurationSeconds) || 10);
   const trimStart = Math.max(0, Number(trimStartSeconds) || 0);
   const tmpDir = await fs.mkdtemp(
@@ -159,6 +162,7 @@ export async function prepareStockClip(
       },
     };
   } catch (error) {
+    logFfmpegError("prepare-stock-clip", error, { remoteUrl, tmpDir });
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     throw error;
   }

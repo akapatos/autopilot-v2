@@ -2,10 +2,11 @@ import fs from "fs/promises";
 import path from "path";
 import os from "os";
 import ffmpeg from "fluent-ffmpeg";
-import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import { v2 as cloudinary } from "cloudinary";
-
-ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+import {
+  ensureFfmpegConfigured,
+  logFfmpegError,
+} from "@/lib/pipeline/ffmpeg-check";
 
 const CROSSFADE_SECONDS = 0.5;
 
@@ -99,7 +100,7 @@ function normalizeSegment(inputPath, outputPath) {
           resolve();
         })
         .on("error", (err) => {
-          console.error("[ffmpeg] Segment normalization failed", err.message);
+          logFfmpegError("concat-normalize-segment", err, { inputPath, outputPath });
           reject(err);
         })
         .run();
@@ -207,7 +208,7 @@ function runFfmpegXfade(segmentPaths, outputPath, crossfadeSec = CROSSFADE_SECON
           resolve();
         })
         .on("error", (err) => {
-          console.error("[ffmpeg] Xfade concat failed", err.message);
+          logFfmpegError("concat-xfade", err, { segmentCount: segmentPaths.length });
           reject(err);
         })
         .run();
@@ -335,6 +336,8 @@ export async function concatenateSegmentsWithFfmpeg(
     throw new Error("No segments to concatenate");
   }
 
+  await ensureFfmpegConfigured();
+
   const tmpDir = await fs.mkdtemp(
     path.join(os.tmpdir(), "autopilot-assemble-"),
   );
@@ -405,6 +408,12 @@ export async function concatenateSegmentsWithFfmpeg(
     });
 
     return result;
+  } catch (error) {
+    logFfmpegError("concat-final", error, {
+      finalPublicId,
+      segmentCount: segmentUrls.length,
+    });
+    throw error;
   } finally {
     console.log("[ffmpeg] Deleting temp directory", { tmpDir });
     await fs.rm(tmpDir, { recursive: true, force: true });

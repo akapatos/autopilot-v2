@@ -85,3 +85,96 @@ export async function createSceneSegment({
 
   return result;
 }
+
+/**
+ * Build a scene from remote stock URL (no local FFmpeg). Trims and overlays voice in Cloudinary.
+ */
+export async function createSceneSegmentFromRemote({
+  fileUrl,
+  audioPublicId,
+  trimStart,
+  duration,
+  segmentPublicId,
+}) {
+  console.log("[cloudinary] Creating scene segment from remote URL (no FFmpeg)", {
+    segmentPublicId,
+    trimStart,
+    duration,
+    fileUrl: fileUrl?.slice?.(0, 120),
+  });
+
+  return createSceneSegment({
+    videoSource: fileUrl,
+    audioPublicId,
+    trimStart,
+    duration,
+    segmentPublicId,
+  });
+}
+
+/**
+ * Concatenate uploaded scene segments with Cloudinary splice (hard cuts, no xfade).
+ */
+export async function concatenateSegmentsCloudinary(
+  segmentPublicIds,
+  finalPublicId,
+) {
+  if (!segmentPublicIds?.length) {
+    throw new Error("No segments to concatenate");
+  }
+
+  const sourceUrl = cloudinary.url(segmentPublicIds[0], {
+    resource_type: "video",
+    secure: true,
+    format: "mp4",
+  });
+
+  if (segmentPublicIds.length === 1) {
+    console.log("[cloudinary] Single segment — copying to final public_id", {
+      finalPublicId,
+      sourcePublicId: segmentPublicIds[0],
+    });
+
+    return cloudinary.uploader.upload(sourceUrl, {
+      resource_type: "video",
+      public_id: finalPublicId,
+      overwrite: true,
+      timeout: 300000,
+    });
+  }
+
+  const transformation = [];
+  for (let i = 1; i < segmentPublicIds.length; i++) {
+    transformation.push({
+      overlay: {
+        resource_type: "video",
+        public_id: segmentPublicIds[i],
+      },
+    });
+    transformation.push({ flags: "splice" });
+  }
+
+  console.log("[cloudinary] Concatenating segments with splice (no xfade)", {
+    finalPublicId,
+    segmentCount: segmentPublicIds.length,
+    basePublicId: segmentPublicIds[0],
+    spliceCount: segmentPublicIds.length - 1,
+  });
+
+  const result = await cloudinary.uploader.upload(sourceUrl, {
+    resource_type: "video",
+    public_id: finalPublicId,
+    overwrite: true,
+    timeout: 300000,
+    transformation,
+  });
+
+  console.log("[cloudinary] Splice concat complete", {
+    publicId: result.public_id,
+    url: result.secure_url,
+    duration: result.duration,
+    bytes: result.bytes,
+  });
+
+  return result;
+}
