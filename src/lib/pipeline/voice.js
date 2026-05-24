@@ -29,8 +29,23 @@ async function streamToBuffer(stream) {
 }
 
 /**
- * Generate voiceover and upload to Cloudinary for assembly.
- * @returns {Promise<string>} HTTPS URL of the uploaded audio
+ * Apply measured voice duration to a clip (replaces Claude's estimated duration).
+ */
+export function applyVoiceTimingToClip(clip, { voice_url, voice_duration }) {
+  const duration = Number(voice_duration);
+
+  return {
+    ...clip,
+    voice_url,
+    voice_duration: duration,
+    duration,
+    trim_end: duration,
+    trim_start: Number(clip.trim_start ?? 0),
+  };
+}
+
+/**
+ * @returns {Promise<{ voice_url: string, voice_duration: number }>}
  */
 export async function generateVoiceover(narration, voice, videoId, sceneIndex) {
   const voiceId = resolveVoiceId(voice);
@@ -72,12 +87,24 @@ export async function generateVoiceover(narration, voice, videoId, sceneIndex) {
     uploadStream.end(audioBuffer);
   });
 
-  console.log("[voice] Voiceover uploaded", {
+  if (uploadResult.duration == null) {
+    throw new Error(
+      "Cloudinary did not return audio duration for voiceover upload",
+    );
+  }
+
+  const voice_duration = Number(uploadResult.duration);
+
+  console.log("[voice] Voiceover duration from Cloudinary", {
     videoId,
     sceneIndex,
+    voice_duration,
+    trim_end: voice_duration,
     url: uploadResult.secure_url,
-    publicId: uploadResult.public_id,
   });
 
-  return uploadResult.secure_url;
+  return {
+    voice_url: uploadResult.secure_url,
+    voice_duration,
+  };
 }

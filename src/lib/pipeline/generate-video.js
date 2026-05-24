@@ -1,7 +1,10 @@
 import { createServiceClient } from "@/lib/supabase";
 import { generateScript } from "@/lib/pipeline/script";
 import { fetchStockVideo } from "@/lib/pipeline/stock";
-import { generateVoiceover } from "@/lib/pipeline/voice";
+import {
+  applyVoiceTimingToClip,
+  generateVoiceover,
+} from "@/lib/pipeline/voice";
 import {
   GENERATION_STAGES,
   VIDEO_STATUS,
@@ -96,6 +99,7 @@ export async function runVideoGenerationPipeline({
     });
 
     const clips = [];
+    const usedPexelsIds = new Set();
 
     // --- Footage ---
     await updateVideo(supabase, videoId, {
@@ -110,17 +114,28 @@ export async function runVideoGenerationPipeline({
         visualKeyword: scene.visualKeyword,
       });
 
-      const stock = await fetchStockVideo(scene.visualKeyword);
+      const stock = await fetchStockVideo(scene.visualKeyword, {
+        usedPexelsIds,
+        neededDuration: scene.duration,
+      });
+
+      if (stock.pexels_id) {
+        usedPexelsIds.add(stock.pexels_id);
+      }
 
       clips.push({
         file_url: stock.file_url,
         narration: scene.narration,
         visual_keyword: scene.visualKeyword,
+        script_duration: scene.duration,
         duration: scene.duration,
-        trim_start: 0,
+        trim_start: stock.trim_start ?? 0,
         trim_end: scene.duration,
         source: stock.source,
+        pexels_id: stock.pexels_id ?? null,
+        stock_duration: stock.stock_duration ?? null,
         voice_url: null,
+        voice_duration: null,
       });
 
       await updateVideo(supabase, videoId, { clips: [...clips] });
@@ -143,14 +158,14 @@ export async function runVideoGenerationPipeline({
         index: i,
       });
 
-      const voiceUrl = await generateVoiceover(
+      const voiceResult = await generateVoiceover(
         clip.narration,
         voice,
         videoId,
         i,
       );
 
-      clips[i] = { ...clip, voice_url: voiceUrl };
+      clips[i] = applyVoiceTimingToClip(clip, voiceResult);
       await updateVideo(supabase, videoId, { clips: [...clips] });
     }
 
