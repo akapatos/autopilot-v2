@@ -1,3 +1,6 @@
+export const maxDuration = 300;
+export const dynamic = "force-dynamic";
+
 import { NextResponse } from "next/server";
 import { createServiceClient } from "@/lib/supabase";
 import { waitUntil } from "@/lib/wait-until";
@@ -6,9 +9,6 @@ import {
   GENERATION_STAGES,
   VIDEO_STATUS,
 } from "@/lib/pipeline/constants";
-
-export const dynamic = "force-dynamic";
-export const maxDuration = 300;
 
 export async function POST(request) {
   console.log("[generate] POST /api/generate received");

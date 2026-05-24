@@ -1,3 +1,6 @@
+export const maxDuration = 300;
+export const dynamic = "force-dynamic";
+
 import { NextResponse } from "next/server";
 import {
   createSceneSegment,
@@ -6,9 +9,6 @@ import {
 } from "@/lib/pipeline/cloudinary";
 import { concatenateSegmentsWithFfmpeg } from "@/lib/pipeline/ffmpeg-concat";
 import { prepareStockClip } from "@/lib/pipeline/ffmpeg-prepare";
-
-export const dynamic = "force-dynamic";
-export const maxDuration = 300;
 
 const CROSSFADE_SECONDS = 0.5;
 

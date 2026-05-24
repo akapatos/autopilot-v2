@@ -1,0 +1,10 @@
+{
+  "functions": {
+    "src/app/api/assemble/route.js": {
+      "maxDuration": 300
+    },
+    "src/app/api/generate/route.js": {
+      "maxDuration": 300
+    }
+  }
+}
