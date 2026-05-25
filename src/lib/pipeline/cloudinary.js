@@ -24,24 +24,84 @@ export function getClipTrimDuration(clip) {
 }
 
 /**
+ * Normalise Cloudinary SDK / API errors for logging.
+ */
+export function extractCloudinaryError(error) {
+  if (!error) {
+    return { message: "Unknown error (null)" };
+  }
+
+  const nested = error.error ?? error.response?.body?.error ?? null;
+
+  return {
+    name: error.name ?? nested?.name ?? null,
+    message: error.message ?? String(error),
+    http_code:
+      error.http_code ??
+      error.statusCode ??
+      nested?.http_code ??
+      nested?.status ??
+      null,
+    cloudinaryMessage:
+      nested?.message ?? error.message ?? String(error),
+    cloudinaryError: nested ?? undefined,
+    requestId: error.request_id ?? nested?.request_id ?? null,
+    raw:
+      typeof error === "object" && error !== null
+        ? {
+            keys: Object.keys(error),
+            ...(nested && typeof nested === "object"
+              ? { nestedKeys: Object.keys(nested) }
+              : {}),
+          }
+        : String(error),
+  };
+}
+
+/**
+ * Run a Cloudinary operation with structured error logging before re-throw.
+ */
+async function withCloudinaryCall(operation, context, fn) {
+  console.log("[cloudinary] Starting operation", { operation, ...context });
+
+  try {
+    const result = await fn();
+    console.log("[cloudinary] Operation succeeded", {
+      operation,
+      publicId: result?.public_id ?? context.publicId ?? null,
+      duration: result?.duration ?? null,
+      bytes: result?.bytes ?? null,
+    });
+    return result;
+  } catch (error) {
+    const cloudinaryDetails = extractCloudinaryError(error);
+
+    console.error("[cloudinary] Operation failed", {
+      operation,
+      ...context,
+      ...cloudinaryDetails,
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+
+    throw error;
+  }
+}
+
+/**
  * Upload voiceover (MP3). Audio assets use resource_type `video` in Cloudinary.
  */
 export async function uploadRemoteAudio(url, publicId) {
-  console.log("[cloudinary] Uploading remote audio", { publicId, url });
-
-  const result = await cloudinary.uploader.upload(url, {
-    resource_type: "video",
-    public_id: publicId,
-    overwrite: true,
-    timeout: 120000,
-  });
-
-  console.log("[cloudinary] Audio uploaded", {
-    publicId: result.public_id,
-    duration: result.duration,
-  });
-
-  return result;
+  return withCloudinaryCall(
+    "uploadRemoteAudio",
+    { publicId, url },
+    () =>
+      cloudinary.uploader.upload(url, {
+        resource_type: "video",
+        public_id: publicId,
+        overwrite: true,
+        timeout: 120000,
+      }),
+  );
 }
 
 /**
@@ -55,35 +115,38 @@ export async function createSceneSegment({
   segmentPublicId,
 }) {
   const audioOverlay = toOverlayPublicId(audioPublicId);
+  const videoSourceLabel =
+    typeof videoSource === "string" && videoSource.startsWith("http")
+      ? videoSource
+      : typeof videoSource === "string"
+        ? `[local:${videoSource}]`
+        : String(videoSource);
 
-  console.log("[cloudinary] Creating scene segment", {
-    segmentPublicId,
-    audioOverlay,
-    trimStart,
-    duration,
-  });
-
-  const result = await cloudinary.uploader.upload(videoSource, {
-    resource_type: "video",
-    public_id: segmentPublicId,
-    overwrite: true,
-    timeout: 180000,
-    transformation: [
-      { start_offset: trimStart, duration },
-      { audio_codec: "none" },
-      { overlay: `audio:${audioOverlay}` },
-      { flags: "layer_apply" },
-      { format: "mp4", video_codec: "h264" },
-    ],
-  });
-
-  console.log("[cloudinary] Scene segment ready", {
-    publicId: result.public_id,
-    url: result.secure_url,
-    duration: result.duration,
-  });
-
-  return result;
+  return withCloudinaryCall(
+    "createSceneSegment",
+    {
+      segmentPublicId,
+      audioPublicId,
+      audioOverlay,
+      trimStart,
+      duration,
+      videoSource: videoSourceLabel,
+    },
+    () =>
+      cloudinary.uploader.upload(videoSource, {
+        resource_type: "video",
+        public_id: segmentPublicId,
+        overwrite: true,
+        timeout: 180000,
+        transformation: [
+          { start_offset: trimStart, duration },
+          { audio_codec: "none" },
+          { overlay: `audio:${audioOverlay}` },
+          { flags: "layer_apply" },
+          { format: "mp4", video_codec: "h264" },
+        ],
+      }),
+  );
 }
 
 /**
@@ -96,13 +159,6 @@ export async function createSceneSegmentFromRemote({
   duration,
   segmentPublicId,
 }) {
-  console.log("[cloudinary] Creating scene segment from remote URL (no FFmpeg)", {
-    segmentPublicId,
-    trimStart,
-    duration,
-    fileUrl: fileUrl?.slice?.(0, 120),
-  });
-
   return createSceneSegment({
     videoSource: fileUrl,
     audioPublicId,
@@ -130,17 +186,21 @@ export async function concatenateSegmentsCloudinary(
   });
 
   if (segmentPublicIds.length === 1) {
-    console.log("[cloudinary] Single segment — copying to final public_id", {
-      finalPublicId,
-      sourcePublicId: segmentPublicIds[0],
-    });
-
-    return cloudinary.uploader.upload(sourceUrl, {
-      resource_type: "video",
-      public_id: finalPublicId,
-      overwrite: true,
-      timeout: 300000,
-    });
+    return withCloudinaryCall(
+      "concatenateSegmentsCloudinary.single",
+      {
+        finalPublicId,
+        sourcePublicId: segmentPublicIds[0],
+        sourceUrl,
+      },
+      () =>
+        cloudinary.uploader.upload(sourceUrl, {
+          resource_type: "video",
+          public_id: finalPublicId,
+          overwrite: true,
+          timeout: 300000,
+        }),
+    );
   }
 
   const transformation = [];
@@ -154,27 +214,23 @@ export async function concatenateSegmentsCloudinary(
     transformation.push({ flags: "splice" });
   }
 
-  console.log("[cloudinary] Concatenating segments with splice (no xfade)", {
-    finalPublicId,
-    segmentCount: segmentPublicIds.length,
-    basePublicId: segmentPublicIds[0],
-    spliceCount: segmentPublicIds.length - 1,
-  });
-
-  const result = await cloudinary.uploader.upload(sourceUrl, {
-    resource_type: "video",
-    public_id: finalPublicId,
-    overwrite: true,
-    timeout: 300000,
-    transformation,
-  });
-
-  console.log("[cloudinary] Splice concat complete", {
-    publicId: result.public_id,
-    url: result.secure_url,
-    duration: result.duration,
-    bytes: result.bytes,
-  });
-
-  return result;
+  return withCloudinaryCall(
+    "concatenateSegmentsCloudinary.splice",
+    {
+      finalPublicId,
+      segmentCount: segmentPublicIds.length,
+      segmentPublicIds,
+      basePublicId: segmentPublicIds[0],
+      sourceUrl,
+      transformation,
+    },
+    () =>
+      cloudinary.uploader.upload(sourceUrl, {
+        resource_type: "video",
+        public_id: finalPublicId,
+        overwrite: true,
+        timeout: 300000,
+        transformation,
+      }),
+  );
 }
