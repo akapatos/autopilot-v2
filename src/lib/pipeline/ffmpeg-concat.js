@@ -2,23 +2,16 @@ import fs from "fs/promises";
 import path from "path";
 import os from "os";
 import ffmpeg from "fluent-ffmpeg";
-import { v2 as cloudinary } from "cloudinary";
 import {
   ensureFfmpegConfigured,
   logFfmpegError,
 } from "@/lib/pipeline/ffmpeg-check";
+import { uploadLocalVideo } from "@/lib/pipeline/cloudinary";
 
 const CROSSFADE_SECONDS = 0.5;
 
 const NORMALIZE_VIDEO_FILTER =
   "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,fps=30,format=yuv420p";
-
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
-  secure: true,
-});
 
 function probeMetadata(filePath) {
   return new Promise((resolve, reject) => {
@@ -325,7 +318,7 @@ async function concatNormalizedSegments(
 }
 
 /**
- * Download segment MP4s, normalize, xfade-concatenate (with demuxer fallback), upload.
+ * Download scene segment MP4s from Cloudinary URLs, concat locally with FFmpeg, upload final.
  */
 export async function concatenateSegmentsWithFfmpeg(
   segmentUrls,
@@ -342,9 +335,11 @@ export async function concatenateSegmentsWithFfmpeg(
     path.join(os.tmpdir(), "autopilot-assemble-"),
   );
 
-  console.log("[ffmpeg] Created temp directory", {
+  console.log("[ffmpeg] Final concat: download Cloudinary segments → FFmpeg → upload", {
     tmpDir,
     segmentCount: segmentUrls.length,
+    segmentUrls,
+    finalPublicId,
     crossfadeSec,
   });
 
@@ -393,12 +388,7 @@ export async function concatenateSegmentsWithFfmpeg(
 
     console.log("[ffmpeg] Uploading final MP4 to Cloudinary", { finalPublicId });
 
-    const result = await cloudinary.uploader.upload(outputPath, {
-      resource_type: "video",
-      public_id: finalPublicId,
-      overwrite: true,
-      timeout: 300000,
-    });
+    const result = await uploadLocalVideo(outputPath, finalPublicId);
 
     console.log("[ffmpeg] Final video uploaded", {
       publicId: result.public_id,

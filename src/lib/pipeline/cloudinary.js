@@ -24,37 +24,105 @@ export function getClipTrimDuration(clip) {
 }
 
 /**
- * Normalise Cloudinary SDK / API errors for logging.
+ * Serialize any thrown value (including Cloudinary's nested `error` objects) for logs.
  */
-export function extractCloudinaryError(error) {
-  if (!error) {
-    return { message: "Unknown error (null)" };
+export function serializeError(error) {
+  if (error == null) {
+    return String(error);
+  }
+  if (typeof error === "string") {
+    return error;
   }
 
   const nested = error.error ?? error.response?.body?.error ?? null;
 
+  if (nested != null) {
+    if (typeof nested === "string") {
+      return nested;
+    }
+    if (typeof nested.message === "string" && nested.message) {
+      return nested.message;
+    }
+    try {
+      return JSON.stringify(nested);
+    } catch {
+      // fall through
+    }
+  }
+
+  if (error instanceof Error) {
+    const msg = error.message;
+    if (typeof msg === "string" && msg && msg !== "[object Object]") {
+      return msg;
+    }
+  }
+
+  if (typeof error.message === "string" && error.message && error.message !== "[object Object]") {
+    return error.message;
+  }
+
+  try {
+    const seen = new WeakSet();
+    return JSON.stringify(error, (_key, value) => {
+      if (typeof value === "object" && value !== null) {
+        if (seen.has(value)) {
+          return "[Circular]";
+        }
+        seen.add(value);
+      }
+      return value;
+    });
+  } catch {
+    try {
+      return JSON.stringify({
+        message: error.message,
+        http_code: error.http_code,
+        error: nested,
+      });
+    } catch {
+      return String(error);
+    }
+  }
+}
+
+/**
+ * Normalise Cloudinary SDK / API errors for logging.
+ */
+export function extractCloudinaryError(error) {
+  if (!error) {
+    return { message: "Unknown error (null)", serialized: "null" };
+  }
+
+  const nested = error.error ?? error.response?.body?.error ?? null;
+  const serialized = serializeError(error);
+  const cloudinaryMessage =
+    typeof nested?.message === "string"
+      ? nested.message
+      : nested?.message != null
+        ? serializeError(nested.message)
+        : serialized;
+
   return {
     name: error.name ?? nested?.name ?? null,
-    message: error.message ?? String(error),
+    message:
+      typeof error.message === "string" && error.message !== "[object Object]"
+        ? error.message
+        : cloudinaryMessage,
+    serialized,
     http_code:
       error.http_code ??
       error.statusCode ??
       nested?.http_code ??
       nested?.status ??
       null,
-    cloudinaryMessage:
-      nested?.message ?? error.message ?? String(error),
-    cloudinaryError: nested ?? undefined,
+    cloudinaryMessage,
+    cloudinaryError:
+      nested != null
+        ? typeof nested === "object"
+          ? JSON.parse(JSON.stringify(nested))
+          : nested
+        : undefined,
     requestId: error.request_id ?? nested?.request_id ?? null,
-    raw:
-      typeof error === "object" && error !== null
-        ? {
-            keys: Object.keys(error),
-            ...(nested && typeof nested === "object"
-              ? { nestedKeys: Object.keys(nested) }
-              : {}),
-          }
-        : String(error),
   };
 }
 
@@ -75,16 +143,42 @@ async function withCloudinaryCall(operation, context, fn) {
     return result;
   } catch (error) {
     const cloudinaryDetails = extractCloudinaryError(error);
+    const errorMessage = cloudinaryDetails.cloudinaryMessage || cloudinaryDetails.serialized;
 
     console.error("[cloudinary] Operation failed", {
       operation,
       ...context,
-      ...cloudinaryDetails,
+      errorMessage,
+      errorSerialized: cloudinaryDetails.serialized,
+      http_code: cloudinaryDetails.http_code,
+      cloudinaryMessage: cloudinaryDetails.cloudinaryMessage,
+      cloudinaryError: cloudinaryDetails.cloudinaryError,
       stack: error instanceof Error ? error.stack : undefined,
     });
 
-    throw error;
+    const wrapped = new Error(`[cloudinary:${operation}] ${errorMessage}`, {
+      cause: error,
+    });
+    wrapped.cloudinaryDetails = cloudinaryDetails;
+    throw wrapped;
   }
+}
+
+/**
+ * Upload a local video file to Cloudinary (e.g. FFmpeg final output).
+ */
+export async function uploadLocalVideo(filePath, publicId) {
+  return withCloudinaryCall(
+    "uploadLocalVideo",
+    { publicId, filePath },
+    () =>
+      cloudinary.uploader.upload(filePath, {
+        resource_type: "video",
+        public_id: publicId,
+        overwrite: true,
+        timeout: 300000,
+      }),
+  );
 }
 
 /**

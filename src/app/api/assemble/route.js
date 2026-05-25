@@ -9,6 +9,7 @@ import {
   createSceneSegmentFromRemote,
   extractCloudinaryError,
   getClipTrimDuration,
+  serializeError,
   uploadRemoteAudio,
 } from "@/lib/pipeline/cloudinary";
 import { concatenateSegmentsWithFfmpeg } from "@/lib/pipeline/ffmpeg-concat";
@@ -66,41 +67,50 @@ function summarizeClipsForLog(clips) {
 }
 
 function formatErrorForLog(error) {
+  const serialized = serializeError(error);
+
   if (!(error instanceof Error)) {
-    return { message: String(error) };
+    return { message: serialized, serialized };
   }
+
+  const cloudinary =
+    error.cloudinaryDetails ?? extractCloudinaryError(error.cause ?? error);
 
   return {
     name: error.name,
-    message: error.message,
+    message:
+      error.message && error.message !== "[object Object]"
+        ? error.message
+        : cloudinary.cloudinaryMessage || serialized,
+    serialized,
     stack: error.stack,
     step: error.assemblyStep ?? null,
     clipIndex: error.assemblyClipIndex ?? null,
-    cloudinary: error.cloudinaryDetails ?? extractCloudinaryError(error),
-    cause:
-      error.cause instanceof Error
-        ? {
-            name: error.cause.name,
-            message: error.cause.message,
-            stack: error.cause.stack,
-            cloudinary: extractCloudinaryError(error.cause),
-          }
-        : error.cause,
+    cloudinary,
+    cause: error.cause
+      ? {
+          serialized: serializeError(error.cause),
+          cloudinary: extractCloudinaryError(error.cause),
+        }
+      : null,
   };
 }
 
 function wrapAssemblyError(error, context) {
+  const serialized = serializeError(error);
   const wrapped =
-    error instanceof Error ? error : new Error(String(error));
+    error instanceof Error ? error : new Error(serialized);
+
+  if (!wrapped.message || wrapped.message === "[object Object]") {
+    wrapped.message = serialized;
+  }
 
   if (context.step) wrapped.assemblyStep = context.step;
   if (context.clipIndex != null) wrapped.assemblyClipIndex = context.clipIndex;
   if (context.clips) wrapped.assemblyClips = context.clips;
   if (context.videoId) wrapped.assemblyVideoId = context.videoId;
 
-  wrapped.cloudinaryDetails = extractCloudinaryError(
-    wrapped.cause ?? wrapped,
-  );
+  wrapped.cloudinaryDetails = extractCloudinaryError(wrapped.cause ?? wrapped);
 
   return wrapped;
 }
@@ -247,7 +257,8 @@ async function buildAllSceneSegments(clips, videoId, ffmpegStatus) {
 }
 
 /**
- * Final concat: FFmpeg xfade when possible; Cloudinary splice on failure or no FFmpeg.
+ * Final concat: FFmpeg downloads Cloudinary scene MP4s and concatenates locally.
+ * Cloudinary splice is only used when FFmpeg is unavailable in this environment.
  */
 async function finalizeVideo(segments, videoId, ffmpegStatus) {
   const finalPublicId = `autopilot/${videoId}/final`;
@@ -256,54 +267,33 @@ async function finalizeVideo(segments, videoId, ffmpegStatus) {
   const stepContext = { videoId, segmentPublicIds, segmentUrls };
 
   if (isFfmpegAvailable(ffmpegStatus)) {
-    try {
-      console.log("[assemble] Concatenating with FFmpeg xfade", {
-        videoId,
-        step: ASSEMBLY_STEPS.FINALIZE_FFMPEG,
-        segmentCount: segmentUrls.length,
-        segmentUrls,
-        crossfadeSeconds: CROSSFADE_SECONDS,
-      });
+    console.log("[assemble] Final concat via FFmpeg (download scene MP4s from Cloudinary)", {
+      videoId,
+      step: ASSEMBLY_STEPS.FINALIZE_FFMPEG,
+      segmentCount: segmentUrls.length,
+      segmentUrls,
+      segmentPublicIds,
+      crossfadeSeconds: CROSSFADE_SECONDS,
+    });
 
-      const finalVideo = await runStep(
-        ASSEMBLY_STEPS.FINALIZE_FFMPEG,
-        stepContext,
-        () =>
-          concatenateSegmentsWithFfmpeg(
-            segmentUrls,
-            finalPublicId,
-            CROSSFADE_SECONDS,
-          ),
-      );
-
-      return { finalVideo, concatMethod: "ffmpeg-xfade" };
-    } catch (error) {
-      if (error.assemblyStep === ASSEMBLY_STEPS.FINALIZE_FFMPEG) {
-        logFfmpegError("assemble-final-concat", error, {
-          videoId,
-          segmentCount: segmentUrls.length,
+    const finalVideo = await runStep(
+      ASSEMBLY_STEPS.FINALIZE_FFMPEG,
+      stepContext,
+      () =>
+        concatenateSegmentsWithFfmpeg(
           segmentUrls,
-        });
-        console.warn(
-          "[assemble] FFmpeg final concat failed — falling back to Cloudinary splice",
-          {
-            videoId,
-            step: ASSEMBLY_STEPS.FINALIZE_FFMPEG,
-            message: error.message,
-            segmentUrls,
-            cloudinary: error.cloudinaryDetails,
-          },
-        );
-      } else {
-        throw error;
-      }
-    }
-  } else {
-    console.log(
-      "[assemble] Skipping FFmpeg final concat (unavailable) — using Cloudinary splice",
-      { videoId, segmentPublicIds, segmentUrls },
+          finalPublicId,
+          CROSSFADE_SECONDS,
+        ),
     );
+
+    return { finalVideo, concatMethod: "ffmpeg-xfade" };
   }
+
+  console.warn(
+    "[assemble] FFmpeg unavailable — falling back to Cloudinary splice (no local concat)",
+    { videoId, segmentPublicIds, segmentUrls },
+  );
 
   const finalVideo = await runStep(
     ASSEMBLY_STEPS.FINALIZE_CLOUDINARY,
@@ -387,7 +377,7 @@ export async function POST(request) {
         probeErrors: ffmpegStatus.probeErrors,
       },
       preferredPath: isFfmpegAvailable(ffmpegStatus)
-        ? "ffmpeg-prepare + ffmpeg-xfade"
+        ? "ffmpeg-prepare + ffmpeg-download-concat-upload"
         : "cloudinary-remote + cloudinary-splice",
     });
 
@@ -445,8 +435,10 @@ export async function POST(request) {
       clipIndex: enriched.assemblyClipIndex ?? null,
       message,
       cloudinaryMessage: enriched.cloudinaryDetails?.cloudinaryMessage ?? null,
+      cloudinarySerialized: enriched.cloudinaryDetails?.serialized ?? null,
       cloudinaryHttpCode: enriched.cloudinaryDetails?.http_code ?? null,
       cloudinary: enriched.cloudinaryDetails,
+      errorSerialized: serializeError(enriched),
       clips: enriched.assemblyClips?.length
         ? enriched.assemblyClips
         : summarizeClipsForLog(clips),
