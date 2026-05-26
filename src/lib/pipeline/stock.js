@@ -77,13 +77,22 @@ function selectPexelsFile(video) {
   return { url: best.link, height: best.height ?? null };
 }
 
+/**
+ * Pick the first unused Pexels video from up to SEARCH_LIMIT (10) results.
+ */
 function pickUnusedPexelsVideo(videos, usedPexelsIds) {
   const candidates = videos
     .filter(isPexelsVideoResult)
     .slice(0, SEARCH_LIMIT);
 
-  for (const video of candidates) {
+  for (let i = 0; i < candidates.length; i++) {
+    const video = candidates[i];
+
     if (usedPexelsIds.has(video.id)) {
+      console.log("[stock] Skipping duplicate Pexels ID", {
+        pexels_id: video.id,
+        attempt: i + 1,
+      });
       continue;
     }
 
@@ -100,40 +109,7 @@ function pickUnusedPexelsVideo(videos, usedPexelsIds) {
     };
   }
 
-  let bestUrl = null;
-  let bestHeight = 0;
-  let bestId = null;
-  let bestDuration = null;
-
-  for (const video of candidates) {
-    if (usedPexelsIds.has(video.id)) {
-      continue;
-    }
-
-    for (const file of getMp4FilesFromPexelsVideo(video)) {
-      if (!isValidMp4Url(file.link)) {
-        continue;
-      }
-      const height = file.height || 0;
-      if (height > bestHeight) {
-        bestHeight = height;
-        bestUrl = file.link;
-        bestId = video.id;
-        bestDuration = Number(video.duration) || null;
-      }
-    }
-  }
-
-  if (!bestUrl) {
-    return null;
-  }
-
-  return {
-    url: bestUrl,
-    height: bestHeight,
-    id: bestId,
-    duration: bestDuration,
-  };
+  return null;
 }
 
 function pickPixabayVideoFromHit(hit) {
@@ -178,21 +154,30 @@ export function getSearchKeywords(visualKeyword) {
   return [...new Set(keywords)];
 }
 
-export function computeRandomTrimStart(stockDurationSec, neededDurationSec) {
+/**
+ * Random start offset in [0, (stock_duration - voice_duration) / 2].
+ * Shorter stock than voice returns 0 (FFmpeg will loop to fill).
+ */
+export function computeRandomTrimStart(stockDurationSec, voiceDurationSec) {
   const stock = Number(stockDurationSec) || 0;
-  const needed = Math.max(0.1, Number(neededDurationSec) || 10);
+  const voice = Math.max(0.1, Number(voiceDurationSec) || 10);
 
-  if (stock <= needed + 0.5) {
+  if (stock <= voice) {
     return 0;
   }
 
-  const maxStart = stock - needed - 0.25;
+  const maxStart = (stock - voice) / 2;
+  if (maxStart <= 0) {
+    return 0;
+  }
+
   const start = Math.random() * maxStart;
   return Math.round(start * 1000) / 1000;
 }
 
-function buildStockResult(pick, source, visualKeyword, searchKeyword, neededDuration) {
-  const trim_start = computeRandomTrimStart(pick.duration, neededDuration);
+function buildStockResult(pick, source, visualKeyword, searchKeyword, voiceDuration) {
+  const duration = Math.max(0.1, Number(voiceDuration) || 10);
+  const trim_start = computeRandomTrimStart(pick.duration, duration);
 
   return {
     file_url: pick.url,
@@ -200,6 +185,8 @@ function buildStockResult(pick, source, visualKeyword, searchKeyword, neededDura
     pexels_id: pick.id ?? null,
     stock_duration: pick.duration,
     trim_start,
+    trim_end: duration,
+    duration,
     search_keyword: searchKeyword,
     matched_keyword: visualKeyword,
   };

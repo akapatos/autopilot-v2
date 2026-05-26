@@ -31,6 +31,33 @@ async function downloadToFile(url, destPath, label) {
   return stat.size;
 }
 
+/** Strip any audio from stock footage before muxing voiceover. */
+function stripStockAudio(stockPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg(stockPath)
+      .outputOptions(["-c:v", "copy", "-an", "-movflags", "+faststart"])
+      .output(outputPath)
+      .on("end", () => resolve())
+      .on("error", () => {
+        ffmpeg(stockPath)
+          .outputOptions([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-an",
+            "-movflags",
+            "+faststart",
+          ])
+          .output(outputPath)
+          .on("end", () => resolve())
+          .on("error", (err) => reject(err))
+          .run();
+      })
+      .run();
+  });
+}
+
 /**
  * Trim/loop stock video to target duration, scale to 1080p, mux voiceover audio.
  */
@@ -73,7 +100,6 @@ function runFfmpegSceneMux(
 
     command
       .input(voicePath)
-      .duration(targetDuration)
       .videoFilters(
         "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black",
       )
@@ -94,6 +120,8 @@ function runFfmpegSceneMux(
         "44100",
         "-ac",
         "2",
+        "-t",
+        String(targetDuration),
         "-shortest",
         "-movflags",
         "+faststart",
@@ -125,12 +153,14 @@ export async function buildSceneSegmentWithFfmpeg({
   const targetDuration = Math.max(0.1, Number(targetDurationSeconds) || 10);
   const trimStart = Math.max(0, Number(trimStartSeconds) || 0);
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "autopilot-scene-"));
-  const stockPath = path.join(tmpDir, "stock.mp4");
+  const stockRawPath = path.join(tmpDir, "stock_raw.mp4");
+  const stockPath = path.join(tmpDir, "stock_noaudio.mp4");
   const voicePath = path.join(tmpDir, "voice.mp3");
   const outputPath = path.join(tmpDir, "segment.mp4");
 
   try {
-    await downloadToFile(stockUrl, stockPath, "stock");
+    await downloadToFile(stockUrl, stockRawPath, "stock");
+    await stripStockAudio(stockRawPath, stockPath);
     await downloadToFile(voiceUrl, voicePath, "voice");
 
     const sourceDuration = await probeMediaDuration(stockPath);
