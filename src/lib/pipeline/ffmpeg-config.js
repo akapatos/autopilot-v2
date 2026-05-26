@@ -1,8 +1,8 @@
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
-import { path as ffprobePath } from "@ffprobe-installer/ffprobe";
+import ffprobeInstaller from "@ffprobe-installer/ffprobe";
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
-ffmpeg.setFfprobePath(ffprobePath);
+ffmpeg.setFfprobePath(ffprobeInstaller.path);
 
-export { ffmpeg, ffmpegInstaller, ffprobePath };
+export { ffmpeg, ffmpegInstaller, ffprobeInstaller };

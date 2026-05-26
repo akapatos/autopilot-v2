@@ -2,7 +2,27 @@ export const maxDuration = 300;
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
+import fs from "fs";
+import { createRequire } from "module";
 import { NextResponse } from "next/server";
+
+const require = createRequire(import.meta.url);
+
+/** Log installer binary paths and whether they exist on disk (Vercel debugging). */
+function logInstallerBinaryPaths() {
+  const ffprobePath = require("@ffprobe-installer/ffprobe").path;
+  const ffmpegPath = require("@ffmpeg-installer/ffmpeg").path;
+
+  console.log("[assemble] Installer binary debug", {
+    ffprobePath,
+    ffprobeExists: fs.existsSync(ffprobePath),
+    ffmpegPath,
+    ffmpegExists: fs.existsSync(ffmpegPath),
+    vercel: Boolean(process.env.VERCEL),
+    platform: process.platform,
+    arch: process.arch,
+  });
+}
 import {
   concatenateSegmentsCloudinary,
   createSceneSegment,
@@ -239,6 +259,8 @@ async function finalizeVideo(segments, videoId, ffmpegStatus) {
 }
 
 export async function POST(request) {
+  logInstallerBinaryPaths();
+
   console.log("[assemble] POST /api/assemble received", {
     vercel: Boolean(process.env.VERCEL),
     region: process.env.VERCEL_REGION ?? null,
