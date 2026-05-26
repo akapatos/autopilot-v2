@@ -10,16 +10,6 @@ import {
   VIDEO_STATUS,
 } from "@/lib/pipeline/constants";
 
-function getAppBaseUrl() {
-  if (process.env.NEXT_PUBLIC_APP_URL) {
-    return process.env.NEXT_PUBLIC_APP_URL.replace(/\/$/, "");
-  }
-  if (process.env.VERCEL_URL) {
-    return `https://${process.env.VERCEL_URL}`;
-  }
-  return "http://localhost:3000";
-}
-
 async function updateVideo(supabase, videoId, patch) {
   console.log("[pipeline] Updating video record", { videoId, patch });
 
@@ -35,10 +25,16 @@ async function updateVideo(supabase, videoId, patch) {
 }
 
 async function callAssembleEndpoint(clips, videoId) {
-  const baseUrl = getAppBaseUrl();
-  const url = `${baseUrl}/api/assemble`;
+  const assemblyBase = process.env.ASSEMBLY_SERVER_URL?.replace(/\/$/, "");
+  if (!assemblyBase) {
+    throw new Error(
+      "ASSEMBLY_SERVER_URL is not set — cannot reach the assembly microservice",
+    );
+  }
 
-  console.log("[pipeline] Calling assemble endpoint", {
+  const url = `${assemblyBase}/assemble`;
+
+  console.log("[pipeline] Calling assembly server", {
     videoId,
     url,
     clipCount: clips.length,
@@ -47,7 +43,15 @@ async function callAssembleEndpoint(clips, videoId) {
   const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ clips, videoId }),
+    body: JSON.stringify({
+      clips,
+      videoId,
+      cloudinaryConfig: {
+        cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+        api_key: process.env.CLOUDINARY_API_KEY,
+        api_secret: process.env.CLOUDINARY_API_SECRET,
+      },
+    }),
   });
 
   const data = await response.json();
