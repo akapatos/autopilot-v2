@@ -7,10 +7,7 @@ cloudinary.config({
   secure: true,
 });
 
-/** Cloudinary overlays use `:` instead of `/` in public IDs. */
-export function toOverlayPublicId(publicId) {
-  return publicId.replace(/\//g, ":");
-}
+import { buildSceneSegmentWithFfmpeg } from "@/lib/pipeline/ffmpeg-scene";
 
 /** Scene length from measured voiceover (supports legacy field names). */
 export function getClipTrimDuration(clip) {
@@ -182,84 +179,36 @@ export async function uploadLocalVideo(filePath, publicId) {
 }
 
 /**
- * Upload voiceover (MP3). Audio assets use resource_type `video` in Cloudinary.
- */
-export async function uploadRemoteAudio(url, publicId) {
-  return withCloudinaryCall(
-    "uploadRemoteAudio",
-    { publicId, url },
-    () =>
-      cloudinary.uploader.upload(url, {
-        resource_type: "video",
-        public_id: publicId,
-        overwrite: true,
-        timeout: 120000,
-      }),
-  );
-}
-
-/**
- * Upload a prepared local MP4 and overlay voiceover for the scene duration.
+ * Build scene locally with FFmpeg (trim stock + mux voice), upload plain MP4 to Cloudinary.
+ * Cloudinary is storage only — no transformations.
  */
 export async function createSceneSegment({
-  videoSource,
-  audioPublicId,
+  stockUrl,
+  voiceUrl,
   trimStart,
   duration,
   segmentPublicId,
 }) {
-  const audioOverlay = toOverlayPublicId(audioPublicId);
-  const videoSourceLabel =
-    typeof videoSource === "string" && videoSource.startsWith("http")
-      ? videoSource
-      : typeof videoSource === "string"
-        ? `[local:${videoSource}]`
-        : String(videoSource);
-
-  return withCloudinaryCall(
-    "createSceneSegment",
-    {
-      segmentPublicId,
-      audioPublicId,
-      audioOverlay,
-      trimStart,
-      duration,
-      videoSource: videoSourceLabel,
-    },
-    () =>
-      cloudinary.uploader.upload(videoSource, {
-        resource_type: "video",
-        public_id: segmentPublicId,
-        overwrite: true,
-        timeout: 180000,
-        transformation: [
-          { start_offset: trimStart, duration },
-          { audio_codec: "none" },
-          { overlay: `audio:${audioOverlay}` },
-          { flags: "layer_apply" },
-          { format: "mp4", video_codec: "h264" },
-        ],
-      }),
-  );
-}
-
-/**
- * Build a scene from remote stock URL (no local FFmpeg). Trims and overlays voice in Cloudinary.
- */
-export async function createSceneSegmentFromRemote({
-  fileUrl,
-  audioPublicId,
-  trimStart,
-  duration,
-  segmentPublicId,
-}) {
-  return createSceneSegment({
-    videoSource: fileUrl,
-    audioPublicId,
+  console.log("[cloudinary] createSceneSegment via FFmpeg + plain upload", {
+    segmentPublicId,
     trimStart,
     duration,
-    segmentPublicId,
+    stockUrl: stockUrl?.slice?.(0, 120),
+    voiceUrl: voiceUrl?.slice?.(0, 120),
   });
+
+  const built = await buildSceneSegmentWithFfmpeg({
+    stockUrl,
+    voiceUrl,
+    trimStart,
+    targetDuration: duration,
+  });
+
+  try {
+    return await uploadLocalVideo(built.path, segmentPublicId);
+  } finally {
+    await built.cleanup();
+  }
 }
 
 /**

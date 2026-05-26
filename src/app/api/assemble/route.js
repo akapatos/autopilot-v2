@@ -6,19 +6,15 @@ import { NextResponse } from "next/server";
 import {
   concatenateSegmentsCloudinary,
   createSceneSegment,
-  createSceneSegmentFromRemote,
   extractCloudinaryError,
   getClipTrimDuration,
   serializeError,
-  uploadRemoteAudio,
 } from "@/lib/pipeline/cloudinary";
 import { concatenateSegmentsWithFfmpeg } from "@/lib/pipeline/ffmpeg-concat";
 import {
   checkFfmpegAvailability,
   isFfmpegAvailable,
-  logFfmpegError,
 } from "@/lib/pipeline/ffmpeg-check";
-import { prepareStockClip } from "@/lib/pipeline/ffmpeg-prepare";
 
 const CROSSFADE_SECONDS = 0.5;
 
@@ -27,10 +23,7 @@ const ASSEMBLY_STEPS = {
   VALIDATE_CLIPS: "validate_clips",
   CHECK_FFMPEG: "check_ffmpeg",
   BUILD_SCENES: "build_scenes",
-  SCENE_UPLOAD_AUDIO: "scene_upload_audio",
-  SCENE_FFMPEG_PREPARE: "scene_ffmpeg_prepare",
   SCENE_CREATE_SEGMENT: "scene_create_segment",
-  SCENE_CREATE_SEGMENT_REMOTE: "scene_create_segment_remote",
   FINALIZE_VIDEO: "finalize_video",
   FINALIZE_FFMPEG: "finalize_ffmpeg_concat",
   FINALIZE_CLOUDINARY: "finalize_cloudinary_splice",
@@ -137,12 +130,11 @@ async function runStep(step, context, fn) {
 }
 
 /**
- * Build one scene: FFmpeg-normalised stock when available, else Cloudinary remote upload.
+ * Build one scene: FFmpeg downloads stock + voice, muxes locally, plain upload to Cloudinary.
  */
 async function buildSceneSegment(clip, videoId, index, ffmpegStatus, allClips) {
   const voiceDuration = getClipTrimDuration(clip);
   const trimStart = Number(clip.trim_start ?? 0);
-  const audioPublicId = `autopilot/${videoId}/raw/scene_${index}_audio`;
   const segmentPublicId = `autopilot/${videoId}/segments/scene_${index}`;
   const stepContext = {
     videoId,
@@ -151,86 +143,28 @@ async function buildSceneSegment(clip, videoId, index, ffmpegStatus, allClips) {
     clips: allClips,
   };
 
-  console.log("[assemble] Building scene", {
-    videoId,
-    index,
-    step: ASSEMBLY_STEPS.BUILD_SCENES,
-    clip: summarizeClipForLog(clip, index),
-    voiceDuration,
-    trimStart,
-    ffmpegAvailable: isFfmpegAvailable(ffmpegStatus),
-  });
-
-  await runStep(ASSEMBLY_STEPS.SCENE_UPLOAD_AUDIO, stepContext, () =>
-    uploadRemoteAudio(clip.voice_url, audioPublicId),
-  );
-
-  if (isFfmpegAvailable(ffmpegStatus)) {
-    try {
-      const prepared = await runStep(
-        ASSEMBLY_STEPS.SCENE_FFMPEG_PREPARE,
-        stepContext,
-        () => prepareStockClip(clip.file_url, voiceDuration, trimStart),
-      );
-
-      try {
-        const segment = await runStep(
-          ASSEMBLY_STEPS.SCENE_CREATE_SEGMENT,
-          { ...stepContext, segmentPublicId, audioPublicId },
-          () =>
-            createSceneSegment({
-              videoSource: prepared.path,
-              audioPublicId,
-              trimStart,
-              duration: voiceDuration,
-              segmentPublicId,
-            }),
-        );
-
-        return {
-          public_id: segment.public_id,
-          secure_url: segment.secure_url,
-          method: "ffmpeg-prepare",
-        };
-      } finally {
-        await prepared.cleanup();
-      }
-    } catch (error) {
-      if (error.assemblyStep === ASSEMBLY_STEPS.SCENE_CREATE_SEGMENT) {
-        throw error;
-      }
-
-      logFfmpegError("assemble-scene-prepare", error, {
-        videoId,
-        index,
-        file_url: clip.file_url,
-        voice_url: clip.voice_url,
-      });
-      console.warn(
-        "[assemble] FFmpeg scene prep failed — falling back to Cloudinary remote segment",
-        {
-          videoId,
-          index,
-          step: error.assemblyStep ?? ASSEMBLY_STEPS.SCENE_FFMPEG_PREPARE,
-          message: error.message,
-          clip: summarizeClipForLog(clip, index),
-        },
-      );
-    }
-  } else {
-    console.log(
-      "[assemble] Skipping FFmpeg scene prep (unavailable) — using Cloudinary remote segment",
-      { videoId, index, clip: summarizeClipForLog(clip, index) },
+  if (!isFfmpegAvailable(ffmpegStatus)) {
+    throw new Error(
+      "FFmpeg is required to build scene segments (download stock, trim, mux voice)",
     );
   }
 
+  console.log("[assemble] Building scene with FFmpeg (no Cloudinary transforms)", {
+    videoId,
+    index,
+    clip: summarizeClipForLog(clip, index),
+    voiceDuration,
+    trimStart,
+    segmentPublicId,
+  });
+
   const segment = await runStep(
-    ASSEMBLY_STEPS.SCENE_CREATE_SEGMENT_REMOTE,
-    { ...stepContext, segmentPublicId, audioPublicId, fileUrl: clip.file_url },
+    ASSEMBLY_STEPS.SCENE_CREATE_SEGMENT,
+    { ...stepContext, segmentPublicId },
     () =>
-      createSceneSegmentFromRemote({
-        fileUrl: clip.file_url,
-        audioPublicId,
+      createSceneSegment({
+        stockUrl: clip.file_url,
+        voiceUrl: clip.voice_url,
         trimStart,
         duration: voiceDuration,
         segmentPublicId,
@@ -240,7 +174,7 @@ async function buildSceneSegment(clip, videoId, index, ffmpegStatus, allClips) {
   return {
     public_id: segment.public_id,
     secure_url: segment.secure_url,
-    method: "cloudinary-remote",
+    method: "ffmpeg-local",
   };
 }
 
@@ -377,8 +311,8 @@ export async function POST(request) {
         probeErrors: ffmpegStatus.probeErrors,
       },
       preferredPath: isFfmpegAvailable(ffmpegStatus)
-        ? "ffmpeg-prepare + ffmpeg-download-concat-upload"
-        : "cloudinary-remote + cloudinary-splice",
+        ? "ffmpeg-scene-mux + ffmpeg-final-concat"
+        : "unavailable (FFmpeg required for scenes)",
     });
 
     currentStep = ASSEMBLY_STEPS.BUILD_SCENES;
