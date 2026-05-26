@@ -1,8 +1,7 @@
 import fs from "fs/promises";
 import { execFile } from "child_process";
 import { promisify } from "util";
-import ffmpeg from "fluent-ffmpeg";
-import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
+import { ffmpeg, ffmpegInstaller, ffprobePath } from "@/lib/pipeline/ffmpeg-config";
 
 const execFileAsync = promisify(execFile);
 
@@ -75,9 +74,11 @@ export async function checkFfmpegAvailability({ force = false } = {}) {
       status.workingPath = probe.path;
       status.versionLine = probe.versionLine;
       ffmpeg.setFfmpegPath(probe.path);
+      ffmpeg.setFfprobePath(ffprobePath);
 
       console.log("[ffmpeg-check] FFmpeg is available", {
         path: probe.path,
+        ffprobePath,
         version: probe.versionLine,
       });
 
