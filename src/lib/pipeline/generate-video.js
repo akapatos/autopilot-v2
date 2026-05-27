@@ -1,5 +1,10 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { createServiceClient } from "@/lib/supabase";
+import { uploadLocalVideo } from "@/lib/pipeline/cloudinary";
 import { generateScript } from "@/lib/pipeline/script";
+import { renderSceneComposition } from "@/lib/pipeline/remotion";
 import { fetchStockVideo } from "@/lib/pipeline/stock";
 import {
   applyVoiceTimingToClip,
@@ -10,6 +15,133 @@ import {
   VIDEO_STATUS,
 } from "@/lib/pipeline/constants";
 import { getErrorMessage } from "@/lib/pipeline/error-message";
+
+function isMotionGraphicScene(scene) {
+  const type = String(scene.compositionType || "stock").toLowerCase();
+  return type !== "stock";
+}
+
+function buildClipFromStock(scene, stock) {
+  return {
+    file_url: stock.file_url,
+    narration: scene.narration,
+    visual_keyword: scene.visualKeyword,
+    visual_description: scene.visualDescription ?? null,
+    visual_mood: scene.visualMood ?? null,
+    camera_style: scene.cameraStyle ?? null,
+    composition_type: scene.compositionType ?? "stock",
+    composition_props: scene.compositionProps ?? null,
+    remotion_composition_id: null,
+    script_duration: scene.duration,
+    duration: stock.duration ?? scene.duration,
+    trim_start: stock.trim_start ?? 0,
+    trim_end: stock.trim_end ?? scene.duration,
+    source: stock.source,
+    pexels_id: stock.pexels_id ?? null,
+    stock_duration: stock.stock_duration ?? null,
+    voice_url: null,
+    voice_duration: null,
+  };
+}
+
+/**
+ * Motion graphic via Remotion + Cloudinary, or Pexels/Pixabay for stock scenes.
+ * Falls back to stock if Remotion render/upload fails.
+ */
+async function fetchFootageForScene(scene, { videoId, sceneIndex, usedPexelsIds }) {
+  if (!isMotionGraphicScene(scene)) {
+    console.log("[pipeline] Stock footage scene", {
+      videoId,
+      sceneIndex,
+      compositionType: scene.compositionType || "stock",
+      visualKeyword: scene.visualKeyword,
+    });
+
+    const stock = await fetchStockVideo(scene.visualKeyword, {
+      usedPexelsIds,
+      neededDuration: scene.duration,
+    });
+
+    if (stock.pexels_id) {
+      usedPexelsIds.add(stock.pexels_id);
+    }
+
+    return buildClipFromStock(scene, stock);
+  }
+
+  const tmpDir = path.join(os.tmpdir(), "autopilot", videoId);
+  await fs.mkdir(tmpDir, { recursive: true });
+  const localPath = path.join(tmpDir, `scene-${sceneIndex}.mp4`);
+
+  console.log("[pipeline] Motion graphic scene — rendering with Remotion", {
+    videoId,
+    sceneIndex,
+    compositionType: scene.compositionType,
+    compositionProps: scene.compositionProps,
+  });
+
+  try {
+    const renderResult = await renderSceneComposition(scene, localPath);
+    if (!renderResult) {
+      throw new Error("Remotion returned null for a motion graphic scene");
+    }
+
+    const publicId = `autopilot/${videoId}/remotion-scene-${sceneIndex}`;
+    const upload = await uploadLocalVideo(localPath, publicId);
+    const duration = Number(scene.duration) || 10;
+
+    console.log("[pipeline] Remotion scene uploaded to Cloudinary", {
+      videoId,
+      sceneIndex,
+      compositionId: renderResult.compositionId,
+      file_url: upload.secure_url,
+    });
+
+    return {
+      file_url: upload.secure_url,
+      narration: scene.narration,
+      visual_keyword: scene.visualKeyword,
+      visual_description: scene.visualDescription ?? null,
+      visual_mood: scene.visualMood ?? null,
+      camera_style: scene.cameraStyle ?? null,
+      composition_type: scene.compositionType,
+      composition_props: scene.compositionProps ?? null,
+      remotion_composition_id: renderResult.compositionId,
+      script_duration: scene.duration,
+      duration,
+      trim_start: 0,
+      trim_end: duration,
+      source: "remotion",
+      pexels_id: null,
+      stock_duration: upload.duration ?? duration,
+      voice_url: null,
+      voice_duration: null,
+    };
+  } catch (remotionError) {
+    console.warn("[pipeline] Remotion failed — falling back to stock footage", {
+      videoId,
+      sceneIndex,
+      compositionType: scene.compositionType,
+      message: getErrorMessage(remotionError),
+    });
+
+    const stock = await fetchStockVideo(scene.visualKeyword, {
+      usedPexelsIds,
+      neededDuration: scene.duration,
+    });
+
+    if (stock.pexels_id) {
+      usedPexelsIds.add(stock.pexels_id);
+    }
+
+    return buildClipFromStock(
+      { ...scene, compositionType: "stock", compositionProps: null },
+      stock,
+    );
+  } finally {
+    await fs.unlink(localPath).catch(() => {});
+  }
+}
 
 async function updateVideo(supabase, videoId, patch) {
   console.log("[pipeline] Updating video record", { videoId, patch });
@@ -132,39 +264,14 @@ export async function runVideoGenerationPipeline({
 
     for (let i = 0; i < scenes.length; i++) {
       const scene = scenes[i];
-      console.log("[pipeline] Fetching footage for scene", {
+
+      const clip = await fetchFootageForScene(scene, {
         videoId,
-        index: i,
-        visualKeyword: scene.visualKeyword,
-      });
-
-      const stock = await fetchStockVideo(scene.visualKeyword, {
+        sceneIndex: i,
         usedPexelsIds,
-        neededDuration: scene.duration,
       });
 
-      if (stock.pexels_id) {
-        usedPexelsIds.add(stock.pexels_id);
-      }
-
-      clips.push({
-        file_url: stock.file_url,
-        narration: scene.narration,
-        visual_keyword: scene.visualKeyword,
-        visual_description: scene.visualDescription ?? null,
-        visual_mood: scene.visualMood ?? null,
-        camera_style: scene.cameraStyle ?? null,
-        script_duration: scene.duration,
-        duration: stock.duration ?? scene.duration,
-        trim_start: stock.trim_start ?? 0,
-        trim_end: stock.trim_end ?? scene.duration,
-        source: stock.source,
-        pexels_id: stock.pexels_id ?? null,
-        stock_duration: stock.stock_duration ?? null,
-        voice_url: null,
-        voice_duration: null,
-      });
-
+      clips.push(clip);
       await updateVideo(supabase, videoId, { clips: [...clips] });
     }
 

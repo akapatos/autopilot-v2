@@ -24,6 +24,15 @@ const VALID_CAMERA = new Set([
   "static",
 ]);
 
+const VALID_COMPOSITION_TYPES = new Set([
+  "animated-map",
+  "timeline",
+  "data-chart",
+  "title-card",
+  "lower-third",
+  "stock",
+]);
+
 function wordCount(text) {
   return String(text)
     .trim()
@@ -114,7 +123,89 @@ function alignDurationsToTarget(scenes, targetSeconds) {
   return out;
 }
 
-function sanitizeScene(scene) {
+function sanitizeCompositionType(rawType, sceneIndex) {
+  const t = String(
+    rawType || "",
+  )
+    .toLowerCase()
+    .trim()
+    .replace(/_/g, "-");
+
+  if (sceneIndex === 0) {
+    return "title-card";
+  }
+
+  if (t === "title-card") {
+    return "stock";
+  }
+
+  if (VALID_COMPOSITION_TYPES.has(t) && t !== "title-card") {
+    return t;
+  }
+
+  return "stock";
+}
+
+function sanitizeCompositionProps(compositionType, props, videoMeta) {
+  const p =
+    props && typeof props === "object" && !Array.isArray(props) ? props : {};
+  const videoTitle = String(videoMeta.title || videoMeta.topic || "").trim();
+  const videoSubtitle = String(
+    videoMeta.niche || videoMeta.style || "",
+  ).trim();
+
+  switch (compositionType) {
+    case "animated-map":
+      return {
+        location: String(p.location || videoMeta.topic || "Location").trim(),
+        lat: Number(p.lat) || 0,
+        lng: Number(p.lng) || 0,
+        zoomLevel: Math.min(10, Math.max(1, Number(p.zoomLevel ?? p.zoom_level) || 4)),
+      };
+    case "timeline": {
+      const events = Array.isArray(p.events) ? p.events : [];
+      return {
+        events: events
+          .slice(0, 8)
+          .map((e) => ({
+            year: String(e?.year ?? "").trim(),
+            title: String(e?.title ?? "").trim(),
+            description: String(e?.description ?? "").trim(),
+          }))
+          .filter((e) => e.year && e.title),
+      };
+    }
+    case "data-chart": {
+      const data = Array.isArray(p.data) ? p.data : [];
+      return {
+        title: String(p.title || videoMeta.topic || "Data").trim(),
+        unit: String(p.unit || "").trim(),
+        data: data
+          .slice(0, 12)
+          .map((row) => ({
+            label: String(row?.label ?? "").trim(),
+            value: Number(row?.value) || 0,
+          }))
+          .filter((row) => row.label),
+      };
+    }
+    case "title-card":
+      return {
+        title: String(p.title || videoTitle || "Untitled").trim(),
+        subtitle: String(p.subtitle || videoSubtitle || "").trim(),
+      };
+    case "lower-third":
+      return {
+        name: String(p.name ?? "").trim(),
+        title: String(p.title ?? p.role ?? "").trim(),
+      };
+    case "stock":
+    default:
+      return null;
+  }
+}
+
+function sanitizeScene(scene, sceneIndex, videoMeta) {
   let mood = String(scene.visualMood || scene.visual_mood || "").toLowerCase();
   if (!VALID_MOODS.has(mood))
     mood = "dramatic";
@@ -124,6 +215,37 @@ function sanitizeScene(scene) {
   ).toLowerCase();
   if (!VALID_CAMERA.has(cam)) cam = "wide";
 
+  let compositionType = sanitizeCompositionType(
+    scene.compositionType || scene.composition_type,
+    sceneIndex,
+  );
+  let compositionProps = sanitizeCompositionProps(
+    compositionType,
+    scene.compositionProps || scene.composition_props,
+    videoMeta,
+  );
+
+  if (compositionType === "lower-third" && !compositionProps?.name) {
+    compositionType = "stock";
+    compositionProps = null;
+  }
+  if (compositionType === "timeline" && !compositionProps?.events?.length) {
+    compositionType = "stock";
+    compositionProps = null;
+  }
+  if (compositionType === "data-chart" && !compositionProps?.data?.length) {
+    compositionType = "stock";
+    compositionProps = null;
+  }
+  if (
+    compositionType === "animated-map" &&
+    (!compositionProps?.location ||
+      (compositionProps.lat === 0 && compositionProps.lng === 0))
+  ) {
+    compositionType = "stock";
+    compositionProps = null;
+  }
+
   return {
     narration: String(scene.narration || "").trim(),
     visualKeyword: String(scene.visualKeyword || scene.visual_keyword || "").trim(),
@@ -132,6 +254,8 @@ function sanitizeScene(scene) {
     ).trim(),
     visualMood: mood,
     cameraStyle: cam,
+    compositionType,
+    compositionProps,
     duration:
       typeof scene.duration === "number"
         ? scene.duration
@@ -169,6 +293,8 @@ function sanitizeTagList(tags, topic, niche) {
  *     cameraStyle: string,
  *     productionNotes: string,
  *     duration: number,
+ *     compositionType: "animated-map" | "timeline" | "data-chart" | "title-card" | "lower-third" | "stock",
+ *     compositionProps: object | null,
  *   }>
  * }>}
  */
@@ -214,7 +340,16 @@ DOCUMENTARY CRAFT (MANDATORY)
 
 7) VISUALS: Each shot must SUPPORT the narration beat. Keywords must be SEARCHABLE stock terms (nouns / places / subjects), never vague ("nice video").
 
-8) Duration math (YOU MUST APPLY): For EACH scene separately,
+8) MOTION GRAPHICS (compositionType + compositionProps) — Pick EXACTLY ONE type per scene:
+   • "title-card" — OPENING SCENE ONLY (scene index 0). Props: { "title", "subtitle" }.
+   • "animated-map" — Scene mentions a specific location, country, city, or geography. Props: { "location", "lat", "lng", "zoomLevel" } (real coordinates; zoomLevel 1–10).
+   • "timeline" — Scene mentions specific dates, years, or a sequence of historical events. Props: { "events": [{ "year", "title", "description" }] } (1–6 events).
+   • "data-chart" — Scene mentions statistics, numbers, percentages, or comparative data. Props: { "title", "data": [{ "label", "value" }], "unit" } (2–8 rows; value numeric).
+   • "lower-third" — First time a named person is introduced in the video. Props: { "name", "title" } (person's role/credential as title).
+   • "stock" — DEFAULT for all other scenes (B-roll with Pexels). Use compositionProps: null.
+   Do NOT use "title-card" after scene 0. Prefer "stock" when unsure.
+
+9) Duration math (YOU MUST APPLY): For EACH scene separately,
    • Count words ONLY in **narration** (excluding stage directions—you must not include stage directions in narration JSON).
    • duration_seconds = ROUND( ( word_count / 130 ) × 60, to one decimal ).
    • Then clamp EACH scene duration to BETWEEN ${MIN_SCENE_SEC} AND ${MAX_SCENE_SEC} seconds (inclusive) unless the TOTAL of all durations would massively exceed ${targetSeconds}; if so, shorten narrations/scene count so the LOGICAL total lands near ${targetSeconds}. The SUM of ALL scene durations should equal exactly ${targetSeconds}.
@@ -234,10 +369,21 @@ OUTPUT FORMAT — Return ONLY valid JSON (no markdown, no prose outside JSON):
       "visualMood": "one word: dramatic | calm | tense | uplifting | mysterious | shocking",
       "cameraStyle": "exactly one of: wide | closeup | aerial | tracking | static",
       "productionNotes": "Editor notes: exact shot progression, text overlays, pacing direction, and music mood changes for this scene",
+      "compositionType": "stock | animated-map | timeline | data-chart | title-card | lower-third",
+      "compositionProps": null,
       "duration": 10.5
     }
   ]
 }
+
+compositionProps examples (match compositionType):
+• title-card: { "title": "Video title", "subtitle": "Hook line or niche" }
+• animated-map: { "location": "Paris, France", "lat": 48.8566, "lng": 2.3522, "zoomLevel": 4 }
+• timeline: { "events": [{ "year": "1789", "title": "Fall of the Bastille", "description": "..." }] }
+• data-chart: { "title": "Global emissions", "unit": "%", "data": [{ "label": "2010", "value": 48 }] }
+• lower-third: { "name": "Dr. Jane Smith", "title": "Historian" }
+• stock: null
+
 
 FINAL CHECK before you output JSON:
 • Sum(scene.duration) === ${targetSeconds} (floating point ±0.5 acceptable; we'll align in code—but get close).
@@ -276,8 +422,12 @@ FINAL CHECK before you output JSON:
     throw new Error("Script must contain at least one scene");
   }
 
-  let scenes = rawScenes.map((s) => ({
-    ...sanitizeScene(s),
+  const title = String(parsed.title || "").trim().slice(0, 60) || `The Untold Truth About ${topic}`.slice(0, 60);
+
+  const videoMeta = { topic, niche, style, title };
+
+  let scenes = rawScenes.map((s, index) => ({
+    ...sanitizeScene(s, index, videoMeta),
     productionNotes: String(
       s.productionNotes || s.production_notes || "",
     ).trim(),
@@ -289,13 +439,13 @@ FINAL CHECK before you output JSON:
   console.log("[script] Documentary script generated", {
     sceneCount: scenes.length,
     targetSeconds,
+    compositionTypes: scenes.map((s) => s.compositionType),
     durationsSample: scenes.slice(0, 3).map((s) => ({
       wc: wordCount(s.narration),
       duration: s.duration,
+      compositionType: s.compositionType,
     })),
   });
-
-  const title = String(parsed.title || "").trim().slice(0, 60) || `The Untold Truth About ${topic}`.slice(0, 60);
   const description = String(parsed.description || "").trim();
   const tags = sanitizeTagList(parsed.tags, topic, niche);
   const thumbnailConcept = String(
