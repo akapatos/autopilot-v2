@@ -7,6 +7,7 @@ import {
   logFfmpegError,
 } from "@/lib/pipeline/ffmpeg-check";
 import { uploadLocalVideo } from "@/lib/pipeline/cloudinary";
+import { getErrorMessage } from "@/lib/pipeline/error-message";
 
 const CROSSFADE_SECONDS = 0.5;
 
@@ -280,7 +281,7 @@ function runFfmpegConcatDemuxer(segmentPaths, outputPath) {
       } catch (copyError) {
         console.warn(
           "[ffmpeg] Concat demuxer stream copy failed, re-encoding",
-          copyError instanceof Error ? copyError.message : copyError,
+          getErrorMessage(copyError),
         );
         await tryConcat(true);
         console.log("[ffmpeg] Concat demuxer fallback complete (re-encoded)", {
@@ -310,7 +311,7 @@ async function concatNormalizedSegments(
   } catch (xfadeError) {
     console.warn(
       "[ffmpeg] Xfade failed after normalization — falling back to concat demuxer",
-      xfadeError instanceof Error ? xfadeError.message : xfadeError,
+      getErrorMessage(xfadeError),
     );
     await runFfmpegConcatDemuxer(normalizedPaths, outputPath);
     return "concat-demuxer";

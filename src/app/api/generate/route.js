@@ -10,6 +10,7 @@ import {
   GENERATION_STAGES,
   VIDEO_STATUS,
 } from "@/lib/pipeline/constants";
+import { getErrorMessage } from "@/lib/pipeline/error-message";
 
 export async function POST(request) {
   console.log("[generate] POST /api/generate received");
@@ -63,7 +64,7 @@ export async function POST(request) {
     if (insertError) {
       console.error("[generate] Supabase insert failed", insertError);
       return NextResponse.json(
-        { error: insertError.message },
+        { error: getErrorMessage(insertError) },
         { status: 500 },
       );
     }
@@ -79,9 +80,10 @@ export async function POST(request) {
       style,
       voice,
     }).catch((error) => {
+      const message = getErrorMessage(error);
       console.error("[generate] Background pipeline error", {
         videoId,
-        message: error instanceof Error ? error.message : String(error),
+        message,
       });
     });
 
@@ -97,8 +99,7 @@ export async function POST(request) {
       message: "Video generation started",
     });
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Generation request failed";
+    const message = getErrorMessage(error) || "Generation request failed";
     console.error("[generate] Request handler error", message);
     return NextResponse.json({ error: message }, { status: 500 });
   }

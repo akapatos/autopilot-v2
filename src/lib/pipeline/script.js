@@ -173,6 +173,7 @@ function sanitizeTagList(tags, topic, niche) {
  * }>}
  */
 export async function generateScript({ topic, niche, length, style }) {
+  try {
   const targetSeconds = Math.round(Number(length) * 60);
 
   const nicheBlock = getNicheGuidance(niche);
@@ -316,4 +317,8 @@ FINAL CHECK before you output JSON:
     fullScript,
     scenes,
   };
+  } catch (error) {
+    console.error("[script] Error:", JSON.stringify(error, null, 2));
+    throw error;
+  }
 }

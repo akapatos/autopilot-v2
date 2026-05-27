@@ -6,16 +6,18 @@ import {
   ffmpegInstaller,
   ffprobeInstaller,
 } from "@/lib/pipeline/ffmpeg-config";
+import { getErrorMessage } from "@/lib/pipeline/error-message";
 
 const execFileAsync = promisify(execFile);
 
 let cachedStatus = null;
 
 function formatExecError(error) {
+  const base = getErrorMessage(error);
   if (!(error instanceof Error)) {
-    return String(error);
+    return base;
   }
-  const parts = [error.message];
+  const parts = [base];
   if ("code" in error && error.code != null) {
     parts.push(`code=${error.code}`);
   }
@@ -128,7 +130,7 @@ export async function ensureFfmpegConfigured() {
 export function logFfmpegError(phase, error, extra = {}) {
   const payload = {
     phase,
-    message: error instanceof Error ? error.message : String(error),
+    message: getErrorMessage(error),
     stack: error instanceof Error ? error.stack : undefined,
     ...extra,
   };

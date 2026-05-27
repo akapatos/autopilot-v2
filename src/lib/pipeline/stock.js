@@ -1,4 +1,5 @@
 import axios from "axios";
+import { getErrorMessage } from "@/lib/pipeline/error-message";
 
 const PEXELS_VIDEOS_SEARCH_URL = "https://api.pexels.com/videos/search";
 const PIXABAY_VIDEOS_API_URL = "https://pixabay.com/api/videos/";
@@ -278,7 +279,7 @@ async function fetchStockVideoForKeyword(visualKeyword, options) {
   } catch (error) {
     console.warn("[stock] Pexels video search failed", {
       keyword: visualKeyword,
-      message: error instanceof Error ? error.message : String(error),
+      message: getErrorMessage(error),
     });
   }
 
@@ -301,7 +302,7 @@ async function fetchStockVideoForKeyword(visualKeyword, options) {
   } catch (error) {
     console.warn("[stock] Pixabay video search failed", {
       keyword: visualKeyword,
-      message: error instanceof Error ? error.message : String(error),
+      message: getErrorMessage(error),
     });
   }
 

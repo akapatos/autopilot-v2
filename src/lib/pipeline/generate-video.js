@@ -9,6 +9,7 @@ import {
   GENERATION_STAGES,
   VIDEO_STATUS,
 } from "@/lib/pipeline/constants";
+import { getErrorMessage } from "@/lib/pipeline/error-message";
 
 async function updateVideo(supabase, videoId, patch) {
   console.log("[pipeline] Updating video record", { videoId, patch });
@@ -62,7 +63,13 @@ async function callAssembleEndpoint(clips, videoId) {
       status: response.status,
       data,
     });
-    throw new Error(data.error || "Assembly failed");
+    const assembleErr =
+      typeof data.error === "string"
+        ? data.error
+        : data.error != null
+          ? JSON.stringify(data.error)
+          : "Assembly failed";
+    throw new Error(assembleErr || "Assembly failed");
   }
 
   console.log("[pipeline] Assemble endpoint succeeded", { videoId, data });
@@ -212,16 +219,18 @@ export async function runVideoGenerationPipeline({
 
     return { videoId, file_url: assembleResult.file_url };
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Unknown pipeline error";
+    const message = getErrorMessage(error) || "Unknown pipeline error";
 
-    console.error("[pipeline] Generation failed", { videoId, message, error });
+    console.error("[pipeline] Generation failed", { videoId, message });
 
     await updateVideo(supabase, videoId, {
       status: VIDEO_STATUS.FAILED,
       error_message: message,
     }).catch((updateError) => {
-      console.error("[pipeline] Failed to mark video as failed", updateError);
+      console.error(
+        "[pipeline] Failed to mark video as failed",
+        getErrorMessage(updateError),
+      );
     });
 
     throw error;
