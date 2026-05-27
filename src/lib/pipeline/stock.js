@@ -3,7 +3,10 @@ import { getErrorMessage } from "@/lib/pipeline/error-message";
 
 const PEXELS_VIDEOS_SEARCH_URL = "https://api.pexels.com/videos/search";
 const PIXABAY_VIDEOS_API_URL = "https://pixabay.com/api/videos/";
-const SEARCH_LIMIT = 10;
+/** Max Pexels results to try per search before query modifiers. */
+const PEXELS_RESULT_LIMIT = 15;
+
+const QUERY_MODIFIERS = ["cinematic", "aerial", "close up", "documentary"];
 
 const IMAGE_EXT_PATTERN = /\.(jpe?g|png|gif|webp|bmp|svg|avif)(\?|$)/i;
 
@@ -79,12 +82,12 @@ function selectPexelsFile(video) {
 }
 
 /**
- * Pick the first unused Pexels video from up to SEARCH_LIMIT (10) results.
+ * Pick the first unused Pexels video from up to PEXELS_RESULT_LIMIT results.
  */
-function pickUnusedPexelsVideo(videos, usedPexelsIds) {
+function pickUnusedPexelsVideo(videos, usedPexelsIds, usedFileUrls) {
   const candidates = videos
     .filter(isPexelsVideoResult)
-    .slice(0, SEARCH_LIMIT);
+    .slice(0, PEXELS_RESULT_LIMIT);
 
   for (let i = 0; i < candidates.length; i++) {
     const video = candidates[i];
@@ -93,6 +96,7 @@ function pickUnusedPexelsVideo(videos, usedPexelsIds) {
       console.log("[stock] Skipping duplicate Pexels ID", {
         pexels_id: video.id,
         attempt: i + 1,
+        totalCandidates: candidates.length,
       });
       continue;
     }
@@ -102,12 +106,53 @@ function pickUnusedPexelsVideo(videos, usedPexelsIds) {
       continue;
     }
 
+    if (usedFileUrls?.has(file.url)) {
+      console.log("[stock] Skipping duplicate file URL", {
+        pexels_id: video.id,
+        attempt: i + 1,
+      });
+      continue;
+    }
+
     return {
       url: file.url,
       height: file.height,
       id: video.id,
       duration: Number(video.duration) || null,
     };
+  }
+
+  return null;
+}
+
+function pickUnusedPixabayVideo(hits, usedPixabayIds, usedFileUrls) {
+  const candidates = hits.filter(isPixabayVideoHit).slice(0, PEXELS_RESULT_LIMIT);
+
+  for (let i = 0; i < candidates.length; i++) {
+    const hit = candidates[i];
+
+    if (hit.id != null && usedPixabayIds?.has(hit.id)) {
+      console.log("[stock] Skipping duplicate Pixabay ID", {
+        pixabay_id: hit.id,
+        attempt: i + 1,
+      });
+      continue;
+    }
+
+    const pick = pickPixabayVideoFromHit(hit);
+    if (!pick?.url || !isValidMp4Url(pick.url)) {
+      continue;
+    }
+
+    if (usedFileUrls?.has(pick.url)) {
+      console.log("[stock] Skipping duplicate Pixabay URL", {
+        pixabay_id: hit.id,
+        attempt: i + 1,
+      });
+      continue;
+    }
+
+    return pick;
   }
 
   return null;
@@ -183,7 +228,8 @@ function buildStockResult(pick, source, visualKeyword, searchKeyword, voiceDurat
   return {
     file_url: pick.url,
     source,
-    pexels_id: pick.id ?? null,
+    pexels_id: source === "pexels" ? (pick.id ?? null) : null,
+    pixabay_id: source === "pixabay" ? (pick.id ?? null) : null,
     stock_duration: pick.duration,
     trim_start,
     trim_end: duration,
@@ -193,7 +239,19 @@ function buildStockResult(pick, source, visualKeyword, searchKeyword, voiceDurat
   };
 }
 
-async function searchPexelsVideos(keyword, usedPexelsIds) {
+function markStockAsUsed(pick, source, usedPexelsIds, usedPixabayIds, usedFileUrls) {
+  if (source === "pexels" && pick.id != null) {
+    usedPexelsIds.add(pick.id);
+  }
+  if (source === "pixabay" && pick.id != null) {
+    usedPixabayIds.add(pick.id);
+  }
+  if (pick.url) {
+    usedFileUrls.add(pick.url);
+  }
+}
+
+async function searchPexelsVideos(keyword, usedPexelsIds, usedFileUrls) {
   const query = encodeURIComponent(keyword);
 
   console.log("[stock] Pexels video search", {
@@ -204,7 +262,7 @@ async function searchPexelsVideos(keyword, usedPexelsIds) {
   const pexelsRes = await axios.get(PEXELS_VIDEOS_SEARCH_URL, {
     params: {
       query: keyword,
-      per_page: SEARCH_LIMIT,
+      per_page: PEXELS_RESULT_LIMIT,
       orientation: "landscape",
     },
     headers: { Authorization: process.env.PEXELS_API_KEY },
@@ -217,7 +275,7 @@ async function searchPexelsVideos(keyword, usedPexelsIds) {
   }
 
   const videos = (pexelsRes.data?.videos || []).filter(isPexelsVideoResult);
-  const picked = pickUnusedPexelsVideo(videos, usedPexelsIds);
+  const picked = pickUnusedPexelsVideo(videos, usedPexelsIds, usedFileUrls);
 
   if (!picked?.url || !isValidMp4Url(picked.url)) {
     return null;
@@ -226,7 +284,7 @@ async function searchPexelsVideos(keyword, usedPexelsIds) {
   return picked;
 }
 
-async function searchPixabayVideos(keyword) {
+async function searchPixabayVideos(keyword, usedPixabayIds, usedFileUrls) {
   console.log("[stock] Pixabay video search", {
     endpoint: PIXABAY_VIDEOS_API_URL,
     keyword,
@@ -238,35 +296,41 @@ async function searchPixabayVideos(keyword) {
       key: process.env.PIXABAY_API_KEY,
       q: keyword,
       video_type: "film",
-      per_page: SEARCH_LIMIT,
+      per_page: PEXELS_RESULT_LIMIT,
     },
     timeout: 30000,
   });
 
   const hits = (pixabayRes.data?.hits || []).filter(isPixabayVideoHit);
-
-  for (const hit of hits) {
-    const pick = pickPixabayVideoFromHit(hit);
-    if (pick?.url && isValidMp4Url(pick.url)) {
-      return pick;
-    }
-  }
-
-  return null;
+  return pickUnusedPixabayVideo(hits, usedPixabayIds, usedFileUrls);
 }
 
 async function fetchStockVideoForKeyword(visualKeyword, options) {
   const usedPexelsIds = options.usedPexelsIds ?? new Set();
+  const usedPixabayIds = options.usedPixabayIds ?? new Set();
+  const usedFileUrls = options.usedFileUrls ?? new Set();
   const neededDuration = options.neededDuration ?? 10;
 
   try {
-    const pexelsPick = await searchPexelsVideos(visualKeyword, usedPexelsIds);
+    const pexelsPick = await searchPexelsVideos(
+      visualKeyword,
+      usedPexelsIds,
+      usedFileUrls,
+    );
     if (pexelsPick) {
+      markStockAsUsed(
+        pexelsPick,
+        "pexels",
+        usedPexelsIds,
+        usedPixabayIds,
+        usedFileUrls,
+      );
       console.log("[stock] Pexels video clip selected", {
         keyword: visualKeyword,
         url: pexelsPick.url,
         pexels_id: pexelsPick.id,
         height: pexelsPick.height,
+        usedPexelsCount: usedPexelsIds.size,
       });
       return buildStockResult(
         pexelsPick,
@@ -284,12 +348,24 @@ async function fetchStockVideoForKeyword(visualKeyword, options) {
   }
 
   try {
-    const pixabayPick = await searchPixabayVideos(visualKeyword);
+    const pixabayPick = await searchPixabayVideos(
+      visualKeyword,
+      usedPixabayIds,
+      usedFileUrls,
+    );
     if (pixabayPick) {
+      markStockAsUsed(
+        pixabayPick,
+        "pixabay",
+        usedPexelsIds,
+        usedPixabayIds,
+        usedFileUrls,
+      );
       console.log("[stock] Pixabay video clip selected", {
         keyword: visualKeyword,
         url: pixabayPick.url,
-        id: pixabayPick.id,
+        pixabay_id: pixabayPick.id,
+        usedPixabayCount: usedPixabayIds.size,
       });
       return buildStockResult(
         pixabayPick,
@@ -309,26 +385,59 @@ async function fetchStockVideoForKeyword(visualKeyword, options) {
   return null;
 }
 
+function buildQueriesForKeyword(keyword) {
+  const trimmed = keyword.trim();
+  const queries = [trimmed];
+
+  for (const mod of QUERY_MODIFIERS) {
+    queries.push(`${trimmed} ${mod}`);
+  }
+
+  return [...new Set(queries)];
+}
+
 /**
  * @param {string} visualKeyword
- * @param {{ usedPexelsIds?: Set<number>, neededDuration?: number }} options
+ * @param {{
+ *   usedPexelsIds?: Set<number>,
+ *   usedPixabayIds?: Set<number>,
+ *   usedFileUrls?: Set<string>,
+ *   neededDuration?: number,
+ * }} options
  */
 export async function fetchStockVideo(visualKeyword, options = {}) {
-  const keywords = getSearchKeywords(visualKeyword);
+  const usedPexelsIds = options.usedPexelsIds ?? new Set();
+  const usedPixabayIds = options.usedPixabayIds ?? new Set();
+  const usedFileUrls = options.usedFileUrls ?? new Set();
+  const stockOptions = {
+    ...options,
+    usedPexelsIds,
+    usedPixabayIds,
+    usedFileUrls,
+  };
+
+  const baseKeywords = getSearchKeywords(visualKeyword);
+  const queriesToTry = [];
+
+  for (const base of baseKeywords) {
+    queriesToTry.push(...buildQueriesForKeyword(base));
+  }
 
   console.log("[stock] Fetching stock video (MP4 only)", {
     visualKeyword,
-    keywordsToTry: keywords,
-    usedPexelsCount: options.usedPexelsIds?.size ?? 0,
+    queriesToTry,
+    usedPexelsCount: usedPexelsIds.size,
+    usedPixabayCount: usedPixabayIds.size,
+    usedUrlCount: usedFileUrls.size,
   });
 
-  for (const keyword of keywords) {
-    const result = await fetchStockVideoForKeyword(keyword, options);
+  for (const query of queriesToTry) {
+    const result = await fetchStockVideoForKeyword(query, stockOptions);
     if (result?.file_url && isValidMp4Url(result.file_url)) {
-      if (keyword !== visualKeyword.trim()) {
-        console.log("[stock] Used fallback keyword", {
+      if (query !== visualKeyword.trim()) {
+        console.log("[stock] Used alternate search query", {
           original: visualKeyword,
-          fallback: keyword,
+          query,
         });
       }
       return result;
@@ -336,6 +445,6 @@ export async function fetchStockVideo(visualKeyword, options = {}) {
   }
 
   throw new Error(
-    `No MP4 stock video found for keyword: ${visualKeyword} (tried: ${keywords.join(", ")})`,
+    `No unused MP4 stock video found for keyword: ${visualKeyword} (tried ${queriesToTry.length} queries)`,
   );
 }

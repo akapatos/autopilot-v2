@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { createServiceClient } from "@/lib/supabase";
 import { uploadLocalVideo } from "@/lib/pipeline/cloudinary";
+import { enforceSceneRules } from "@/lib/pipeline/scene-rules";
 import { generateScript } from "@/lib/pipeline/script";
 import { renderSceneComposition } from "@/lib/pipeline/remotion";
 import { fetchStockVideo } from "@/lib/pipeline/stock";
@@ -48,7 +49,17 @@ function buildClipFromStock(scene, stock) {
  * Motion graphic via Remotion + Cloudinary, or Pexels/Pixabay for stock scenes.
  * Falls back to stock if Remotion render/upload fails.
  */
-async function fetchFootageForScene(scene, { videoId, sceneIndex, usedPexelsIds }) {
+async function fetchFootageForScene(
+  scene,
+  { videoId, sceneIndex, usedPexelsIds, usedPixabayIds, usedFileUrls },
+) {
+  const stockOptions = {
+    usedPexelsIds,
+    usedPixabayIds,
+    usedFileUrls,
+    neededDuration: scene.duration,
+  };
+
   if (!isMotionGraphicScene(scene)) {
     console.log("[pipeline] Stock footage scene", {
       videoId,
@@ -57,15 +68,7 @@ async function fetchFootageForScene(scene, { videoId, sceneIndex, usedPexelsIds 
       visualKeyword: scene.visualKeyword,
     });
 
-    const stock = await fetchStockVideo(scene.visualKeyword, {
-      usedPexelsIds,
-      neededDuration: scene.duration,
-    });
-
-    if (stock.pexels_id) {
-      usedPexelsIds.add(stock.pexels_id);
-    }
-
+    const stock = await fetchStockVideo(scene.visualKeyword, stockOptions);
     return buildClipFromStock(scene, stock);
   }
 
@@ -125,14 +128,7 @@ async function fetchFootageForScene(scene, { videoId, sceneIndex, usedPexelsIds 
       message: getErrorMessage(remotionError),
     });
 
-    const stock = await fetchStockVideo(scene.visualKeyword, {
-      usedPexelsIds,
-      neededDuration: scene.duration,
-    });
-
-    if (stock.pexels_id) {
-      usedPexelsIds.add(stock.pexels_id);
-    }
+    const stock = await fetchStockVideo(scene.visualKeyword, stockOptions);
 
     return buildClipFromStock(
       { ...scene, compositionType: "stock", compositionProps: null },
@@ -229,8 +225,10 @@ export async function runVideoGenerationPipeline({
       generation_stage: GENERATION_STAGES.SCRIPT,
     });
 
+    const targetSeconds = Math.round(Number(length) * 60);
+
     const scriptPackage = await generateScript({ topic, niche, length, style });
-    const {
+    let {
       scenes,
       title,
       description,
@@ -238,6 +236,18 @@ export async function runVideoGenerationPipeline({
       thumbnailConcept,
       fullScript,
     } = scriptPackage;
+
+    scenes = enforceSceneRules(scenes, targetSeconds);
+
+    console.log("[pipeline] Scene rules applied", {
+      videoId,
+      sceneCount: scenes.length,
+      durations: scenes.map((s) => ({
+        duration: s.duration,
+        words: s.narration.split(/\s+/).filter(Boolean).length,
+        keyword: s.visualKeyword,
+      })),
+    });
 
     await updateVideo(supabase, videoId, {
       scenes,
@@ -256,6 +266,8 @@ export async function runVideoGenerationPipeline({
 
     const clips = [];
     const usedPexelsIds = new Set();
+    const usedPixabayIds = new Set();
+    const usedFileUrls = new Set();
 
     // --- Footage ---
     await updateVideo(supabase, videoId, {
@@ -269,6 +281,8 @@ export async function runVideoGenerationPipeline({
         videoId,
         sceneIndex: i,
         usedPexelsIds,
+        usedPixabayIds,
+        usedFileUrls,
       });
 
       clips.push(clip);

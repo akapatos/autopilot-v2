@@ -1,11 +1,15 @@
 import Anthropic from "@anthropic-ai/sdk";
+import {
+  durationFromWordCount,
+  enforceSceneRules,
+  MAX_SCENE_DURATION,
+  MIN_SCENE_DURATION,
+  wordCount,
+} from "@/lib/pipeline/scene-rules";
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
-
-const MIN_SCENE_SEC = 8;
-const MAX_SCENE_SEC = 12;
 
 const VALID_MOODS = new Set([
   "dramatic",
@@ -33,23 +37,6 @@ const VALID_COMPOSITION_TYPES = new Set([
   "stock",
 ]);
 
-function wordCount(text) {
-  return String(text)
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean).length;
-}
-
-/**
- * duration ≈ (wordCount / 130) * 60 seconds at 130 words per minute.
- */
-function durationFromWordCount(narration) {
-  const n = wordCount(narration);
-  const raw = (n / 130) * 60;
-  const rounded = Math.round(raw * 10) / 10;
-  return Math.min(MAX_SCENE_SEC, Math.max(MIN_SCENE_SEC, rounded));
-}
-
 /**
  * Niche-specific writing notes for the system prompt.
  */
@@ -73,54 +60,6 @@ function getNicheGuidance(niche) {
   }
 
   return `NICHE (GENERAL) — Write for a curious general audience. Be clear, vivid, and honest; tailor examples to "${niche}".`;
-}
-
-/**
- * Per-scene duration from (wordCount / 130) × 60, clamped [MIN_SCENE_SEC, MAX_SCENE_SEC].
- * If total runtime ≠ target, absorb the gap on the last scene (or proportionally scale once if needed).
- */
-function alignDurationsToTarget(scenes, targetSeconds) {
-  const LAST_MAX = Math.max(MAX_SCENE_SEC + 6, 36);
-
-  const out = scenes.map((s) => ({
-    ...s,
-    duration: durationFromWordCount(s.narration),
-  }));
-
-  let sum = out.reduce((acc, s) => acc + s.duration, 0);
-  let diff = Math.round((targetSeconds - sum) * 10) / 10;
-
-  if (Math.abs(diff) < 0.05 || out.length === 0) {
-    return out;
-  }
-
-  const lastIdx = out.length - 1;
-  let lastDur = Math.round((out[lastIdx].duration + diff) * 10) / 10;
-  if (lastDur >= MIN_SCENE_SEC && lastDur <= LAST_MAX) {
-    out[lastIdx] = { ...out[lastIdx], duration: lastDur };
-    return out;
-  }
-
-  /** Proportional allocation from word-timing weights */
-  const weights = scenes.map((s) => {
-    const n = wordCount(s.narration);
-    return Math.max(0.01, (n / 130) * 60);
-  });
-  const wsum = weights.reduce((a, b) => a + b, 0) || scenes.length;
-
-  for (let i = 0; i < out.length; i++) {
-    let sec = ((weights[i] / wsum) * targetSeconds);
-    sec = Math.round(sec * 10) / 10;
-    out[i].duration = Math.min(LAST_MAX, Math.max(MIN_SCENE_SEC, sec));
-  }
-
-  sum = out.reduce((acc, s) => acc + s.duration, 0);
-  diff = Math.round((targetSeconds - sum) * 10) / 10;
-  lastDur = Math.round((out[lastIdx].duration + diff) * 10) / 10;
-  lastDur = Math.min(LAST_MAX * 2, Math.max(MIN_SCENE_SEC, lastDur));
-  out[lastIdx] = { ...out[lastIdx], duration: lastDur };
-
-  return out;
 }
 
 function sanitizeCompositionType(rawType, sceneIndex) {
@@ -256,10 +195,9 @@ function sanitizeScene(scene, sceneIndex, videoMeta) {
     cameraStyle: cam,
     compositionType,
     compositionProps,
-    duration:
-      typeof scene.duration === "number"
-        ? scene.duration
-        : Number(scene.duration) || MIN_SCENE_SEC,
+    duration: durationFromWordCount(
+      String(scene.narration || "").trim(),
+    ),
   };
 }
 
@@ -332,15 +270,26 @@ DOCUMENTARY CRAFT (MANDATORY)
 
 4) EACH SCENE (narration):
    • Exactly 2–4 sentences MAX per scene—no paragraphs.
-   • Aim for spoken length ≈ ${MIN_SCENE_SEC}–${MAX_SCENE_SEC} seconds per scene based on pacing (don't stuff one scene with a monologue).
+   • Keep each scene between ${MIN_SCENE_DURATION} and ${MAX_SCENE_DURATION} seconds when spoken (split long beats across scenes if needed).
 
 5) RULE — NO CONSECUTIVE ECHOES: Scene N must NOT begin with the same FIRST WORD as scene N−1's FIRST WORD (trim leading punctuation/spaces).
 
 6) RULE — SCENE ENDINGS: EVERY scene narration must END on a micro-hook—a question, teaser, withheld answer, paradox, or "but then…" beat that pulls the viewer into the next scene.
 
-7) VISUALS: Each shot must SUPPORT the narration beat. Keywords must be SEARCHABLE stock terms (nouns / places / subjects), never vague ("nice video").
+7) VISUAL KEYWORDS (CRITICAL — clip must match narration):
+   • visualKeyword must be HIGHLY SPECIFIC to what is said in THAT EXACT scene's narration—never generic.
+   • If talking about Julius Caesar, use "Julius Caesar Roman general marble bust" not "history" or "Rome".
+   • If talking about the ocean, use "deep ocean waves underwater sunlight" not "nature" or "water".
+   • Include subject + setting + action or era when relevant. Minimum 4–6 specific words per keyword.
+   • Each scene MUST use a DIFFERENT visualKeyword from every other scene (no reuse).
 
-8) MOTION GRAPHICS (compositionType + compositionProps) — Pick EXACTLY ONE type per scene:
+8) DURATION (CRITICAL — you control clip timing):
+   • Each scene's duration must EXACTLY match how long the narration takes to speak at 130 words per minute.
+   • Calculate: duration_seconds = (word_count / 130) * 60 — round to one decimal.
+   • Count words ONLY in the narration field. Never estimate or guess duration—ALWAYS calculate from word count.
+   • Do NOT clamp or round to "about 10 seconds"; use the formula result.
+
+9) MOTION GRAPHICS (compositionType + compositionProps) — Pick EXACTLY ONE type per scene:
    • "title-card" — OPENING SCENE ONLY (scene index 0). Props: { "title", "subtitle" }.
    • "animated-map" — Scene mentions a specific location, country, city, or geography. Props: { "location", "lat", "lng", "zoomLevel" } (real coordinates; zoomLevel 1–10).
    • "timeline" — Scene mentions specific dates, years, or a sequence of historical events. Props: { "events": [{ "year", "title", "description" }] } (1–6 events).
@@ -348,11 +297,6 @@ DOCUMENTARY CRAFT (MANDATORY)
    • "lower-third" — First time a named person is introduced in the video. Props: { "name", "title" } (person's role/credential as title).
    • "stock" — DEFAULT for all other scenes (B-roll with Pexels). Use compositionProps: null.
    Do NOT use "title-card" after scene 0. Prefer "stock" when unsure.
-
-9) Duration math (YOU MUST APPLY): For EACH scene separately,
-   • Count words ONLY in **narration** (excluding stage directions—you must not include stage directions in narration JSON).
-   • duration_seconds = ROUND( ( word_count / 130 ) × 60, to one decimal ).
-   • Then clamp EACH scene duration to BETWEEN ${MIN_SCENE_SEC} AND ${MAX_SCENE_SEC} seconds (inclusive) unless the TOTAL of all durations would massively exceed ${targetSeconds}; if so, shorten narrations/scene count so the LOGICAL total lands near ${targetSeconds}. The SUM of ALL scene durations should equal exactly ${targetSeconds}.
 
 OUTPUT FORMAT — Return ONLY valid JSON (no markdown, no prose outside JSON):
 {
@@ -364,7 +308,7 @@ OUTPUT FORMAT — Return ONLY valid JSON (no markdown, no prose outside JSON):
   "scenes": [
     {
       "narration": "2-4 spoken sentences ending on a hook. No labels like 'Voice:'",
-      "visualKeyword": "3-5 concise search words e.g. ancient Rome colosseum aerial sunset",
+      "visualKeyword": "4-8 highly specific search words matching THIS scene's narration exactly",
       "visualDescription": "One or two vivid sentences stating exactly what the viewer should SEE (composition, era, subjects, motion, time of day if relevant)",
       "visualMood": "one word: dramatic | calm | tense | uplifting | mysterious | shocking",
       "cameraStyle": "exactly one of: wide | closeup | aerial | tracking | static",
@@ -386,9 +330,11 @@ compositionProps examples (match compositionType):
 
 
 FINAL CHECK before you output JSON:
-• Sum(scene.duration) === ${targetSeconds} (floating point ±0.5 acceptable; we'll align in code—but get close).
+• Every scene.duration === round((word_count/130)*60, 1) from its narration (never estimated).
+• Sum(scene.duration) ≈ ${targetSeconds} (±5% acceptable).
+• No two scenes share the same visualKeyword.
 • No two consecutive scenes start with identical first words.
-• First scene honours the HOOK principle.
+• First scene honours the HOOK principle and uses compositionType "title-card".
 `;
 
   const message = await anthropic.messages.create({
@@ -433,8 +379,7 @@ FINAL CHECK before you output JSON:
     ).trim(),
   }));
 
-  /** Primary: word-derived duration; then match target runtime (see alignDurationsToTarget) */
-  scenes = alignDurationsToTarget(scenes, targetSeconds);
+  scenes = enforceSceneRules(scenes, targetSeconds);
 
   console.log("[script] Documentary script generated", {
     sceneCount: scenes.length,
