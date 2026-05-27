@@ -139,16 +139,38 @@ function sanitizeScene(scene) {
   };
 }
 
+function sanitizeTagList(tags, topic, niche) {
+  const arr = Array.isArray(tags) ? tags : [];
+  const cleaned = arr
+    .map((t) => String(t || "").trim().toLowerCase())
+    .filter(Boolean);
+
+  const fallback = [topic, niche, "youtube documentary", "explainer"]
+    .map((t) => String(t || "").trim().toLowerCase())
+    .filter(Boolean);
+
+  const merged = [...cleaned, ...fallback];
+  return [...new Set(merged)].slice(0, 20);
+}
+
 /**
  * @param {{ topic: string, niche: string, length: number, style: string }} params
- * @returns {Promise<Array<{
- *   narration: string,
- *   visualKeyword: string,
- *   visualDescription: string,
- *   visualMood: string,
- *   cameraStyle: string,
- *   duration: number,
- * }>>}
+ * @returns {Promise<{
+ *   title: string,
+ *   description: string,
+ *   tags: string[],
+ *   thumbnailConcept: string,
+ *   fullScript: string,
+ *   scenes: Array<{
+ *     narration: string,
+ *     visualKeyword: string,
+ *     visualDescription: string,
+ *     visualMood: string,
+ *     cameraStyle: string,
+ *     productionNotes: string,
+ *     duration: number,
+ *   }>
+ * }>}
  */
 export async function generateScript({ topic, niche, length, style }) {
   const targetSeconds = Math.round(Number(length) * 60);
@@ -198,6 +220,11 @@ DOCUMENTARY CRAFT (MANDATORY)
 
 OUTPUT FORMAT — Return ONLY valid JSON (no markdown, no prose outside JSON):
 {
+  "title": "Compelling click-worthy title under 60 chars",
+  "description": "150-200 words including topic keywords, CTA, and a timestamps placeholder block (e.g. 00:00 Intro, 00:45 ...)",
+  "tags": ["15-20 lowercase relevant youtube tags"],
+  "thumbnailConcept": "Detailed concept with main image, text overlay suggestion, and colour scheme",
+  "fullScript": "[SCENE 1] ... [SCENE 2] ...",
   "scenes": [
     {
       "narration": "2-4 spoken sentences ending on a hook. No labels like 'Voice:'",
@@ -205,6 +232,7 @@ OUTPUT FORMAT — Return ONLY valid JSON (no markdown, no prose outside JSON):
       "visualDescription": "One or two vivid sentences stating exactly what the viewer should SEE (composition, era, subjects, motion, time of day if relevant)",
       "visualMood": "one word: dramatic | calm | tense | uplifting | mysterious | shocking",
       "cameraStyle": "exactly one of: wide | closeup | aerial | tracking | static",
+      "productionNotes": "Editor notes: exact shot progression, text overlays, pacing direction, and music mood changes for this scene",
       "duration": 10.5
     }
   ]
@@ -247,7 +275,12 @@ FINAL CHECK before you output JSON:
     throw new Error("Script must contain at least one scene");
   }
 
-  let scenes = rawScenes.map((s) => sanitizeScene(s));
+  let scenes = rawScenes.map((s) => ({
+    ...sanitizeScene(s),
+    productionNotes: String(
+      s.productionNotes || s.production_notes || "",
+    ).trim(),
+  }));
 
   /** Primary: word-derived duration; then match target runtime (see alignDurationsToTarget) */
   scenes = alignDurationsToTarget(scenes, targetSeconds);
@@ -261,5 +294,26 @@ FINAL CHECK before you output JSON:
     })),
   });
 
-  return scenes;
+  const title = String(parsed.title || "").trim().slice(0, 60) || `The Untold Truth About ${topic}`.slice(0, 60);
+  const description = String(parsed.description || "").trim();
+  const tags = sanitizeTagList(parsed.tags, topic, niche);
+  const thumbnailConcept = String(
+    parsed.thumbnailConcept || parsed.thumbnail_concept || "",
+  ).trim();
+
+  const fallbackFullScript = scenes
+    .map((scene, idx) => `[SCENE ${idx + 1}] ${scene.narration}`)
+    .join("\n\n");
+  const fullScript =
+    String(parsed.fullScript || parsed.full_script || "").trim() ||
+    fallbackFullScript;
+
+  return {
+    title,
+    description,
+    tags,
+    thumbnailConcept,
+    fullScript,
+    scenes,
+  };
 }

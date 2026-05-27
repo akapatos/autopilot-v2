@@ -90,10 +90,23 @@ export async function runVideoGenerationPipeline({
       generation_stage: GENERATION_STAGES.SCRIPT,
     });
 
-    const scenes = await generateScript({ topic, niche, length, style });
+    const scriptPackage = await generateScript({ topic, niche, length, style });
+    const {
+      scenes,
+      title,
+      description,
+      tags,
+      thumbnailConcept,
+      fullScript,
+    } = scriptPackage;
 
     await updateVideo(supabase, videoId, {
       scenes,
+      title,
+      description,
+      tags,
+      thumbnail_concept: thumbnailConcept,
+      full_script: fullScript,
       generation_stage: GENERATION_STAGES.SCRIPT,
     });
 
