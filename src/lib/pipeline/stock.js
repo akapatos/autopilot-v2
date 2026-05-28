@@ -3,8 +3,15 @@ import { getErrorMessage } from "@/lib/pipeline/error-message";
 
 const PEXELS_VIDEOS_SEARCH_URL = "https://api.pexels.com/videos/search";
 const PIXABAY_VIDEOS_API_URL = "https://pixabay.com/api/videos/";
+const ARCHIVE_SEARCH_URL = "https://archive.org/advancedsearch.php";
+const ARCHIVE_METADATA_URL = "https://archive.org/metadata";
 /** Max Pexels results to try per search before query modifiers. */
 const PEXELS_RESULT_LIMIT = 15;
+const ARCHIVE_RESULT_LIMIT = 10;
+/** Skip Archive.org files larger than this (bytes). */
+const ARCHIVE_MAX_FILE_BYTES = 100 * 1024 * 1024;
+/** Preferred Archive.org video extensions, in priority order. */
+const ARCHIVE_VIDEO_EXTENSIONS = [".mp4", ".mpeg", ".mpg", ".avi"];
 
 const QUERY_MODIFIERS = ["cinematic", "aerial", "close up", "documentary"];
 
@@ -230,6 +237,8 @@ function buildStockResult(pick, source, visualKeyword, searchKeyword, voiceDurat
     source,
     pexels_id: source === "pexels" ? (pick.id ?? null) : null,
     pixabay_id: source === "pixabay" ? (pick.id ?? null) : null,
+    archive_id: source === "archive" ? (pick.id ?? null) : null,
+    archive_title: source === "archive" ? (pick.title ?? null) : null,
     stock_duration: pick.duration,
     trim_start,
     trim_end: duration,
@@ -303,6 +312,159 @@ async function searchPixabayVideos(keyword, usedPixabayIds, usedFileUrls) {
 
   const hits = (pixabayRes.data?.hits || []).filter(isPixabayVideoHit);
   return pickUnusedPixabayVideo(hits, usedPixabayIds, usedFileUrls);
+}
+
+function getArchiveExtensionRank(name) {
+  const lower = String(name || "").toLowerCase();
+  for (let i = 0; i < ARCHIVE_VIDEO_EXTENSIONS.length; i++) {
+    if (lower.endsWith(ARCHIVE_VIDEO_EXTENSIONS[i])) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function isLikelyAudioOnlyFile(file) {
+  const format = String(file?.format || "").toLowerCase();
+  const name = String(file?.name || "").toLowerCase();
+  const audioFormats = ["mp3", "flac", "wav", "ogg", "aiff", "m4a", "audio"];
+  if (audioFormats.some((fmt) => format.includes(fmt))) {
+    return true;
+  }
+  return /\.(mp3|flac|wav|ogg|aiff|m4a)$/.test(name);
+}
+
+/**
+ * Pick the best video file from an Archive.org metadata file list:
+ * prefer .mp4 → .mpeg → .avi, prefer files under 100MB, skip audio-only.
+ */
+function pickBestArchiveFile(files) {
+  if (!Array.isArray(files)) {
+    return null;
+  }
+
+  const candidates = files
+    .filter((file) => {
+      if (!file?.name || isLikelyAudioOnlyFile(file)) {
+        return false;
+      }
+      return getArchiveExtensionRank(file.name) >= 0;
+    })
+    .map((file) => {
+      const size = Number(file.size) || 0;
+      return {
+        name: file.name,
+        size,
+        extRank: getArchiveExtensionRank(file.name),
+        underLimit: size > 0 && size <= ARCHIVE_MAX_FILE_BYTES,
+      };
+    });
+
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  candidates.sort((a, b) => {
+    if (a.underLimit !== b.underLimit) {
+      return a.underLimit ? -1 : 1;
+    }
+    if (a.extRank !== b.extRank) {
+      return a.extRank - b.extRank;
+    }
+    return (a.size || Infinity) - (b.size || Infinity);
+  });
+
+  return candidates[0];
+}
+
+/**
+ * Search Archive.org for a movie clip and resolve a direct video file URL.
+ * @returns {Promise<{ url: string, id: string, title: string, duration: number|null } | null>}
+ */
+export async function fetchArchiveOrgClip(visualKeyword, usedFileUrls = new Set()) {
+  const query = String(visualKeyword || "").trim();
+  if (!query) {
+    return null;
+  }
+
+  console.log("[stock] Archive.org search", {
+    endpoint: ARCHIVE_SEARCH_URL,
+    keyword: query,
+  });
+
+  const searchRes = await axios.get(ARCHIVE_SEARCH_URL, {
+    params: {
+      q: query,
+      mediatype: "movies",
+      "fl[]": ["identifier", "title", "description"],
+      rows: ARCHIVE_RESULT_LIMIT,
+      output: "json",
+    },
+    timeout: 30000,
+  });
+
+  const docs = searchRes.data?.response?.docs;
+  if (!Array.isArray(docs) || docs.length === 0) {
+    console.log("[stock] Archive.org no results", { keyword: query });
+    return null;
+  }
+
+  for (const doc of docs) {
+    const identifier = doc?.identifier;
+    if (!identifier) {
+      continue;
+    }
+
+    let metadata;
+    try {
+      const metaRes = await axios.get(`${ARCHIVE_METADATA_URL}/${identifier}`, {
+        timeout: 30000,
+      });
+      metadata = metaRes.data;
+    } catch (error) {
+      console.warn("[stock] Archive.org metadata fetch failed", {
+        identifier,
+        message: getErrorMessage(error),
+      });
+      continue;
+    }
+
+    const best = pickBestArchiveFile(metadata?.files);
+    if (!best) {
+      continue;
+    }
+
+    const server = metadata?.server;
+    const dir = metadata?.dir;
+    const fileUrl =
+      server && dir
+        ? `https://${server}${dir}/${encodeURIComponent(best.name)}`
+        : `https://archive.org/download/${identifier}/${encodeURIComponent(best.name)}`;
+
+    if (usedFileUrls.has(fileUrl)) {
+      console.log("[stock] Skipping duplicate Archive.org URL", { identifier });
+      continue;
+    }
+
+    const title = String(doc?.title || metadata?.metadata?.title || identifier);
+    const duration = Number(metadata?.metadata?.runtime) || null;
+
+    console.log("[stock] Archive.org clip found", {
+      identifier,
+      title,
+      file: best.name,
+      sizeBytes: best.size,
+      url: fileUrl,
+    });
+
+    return { url: fileUrl, id: identifier, title, duration };
+  }
+
+  console.log("[stock] Archive.org no results", {
+    keyword: query,
+    reason: "no usable video files in metadata",
+  });
+  return null;
 }
 
 async function fetchStockVideoForKeyword(visualKeyword, options) {
@@ -382,6 +544,37 @@ async function fetchStockVideoForKeyword(visualKeyword, options) {
     });
   }
 
+  try {
+    const archivePick = await fetchArchiveOrgClip(visualKeyword, usedFileUrls);
+    if (archivePick) {
+      markStockAsUsed(
+        archivePick,
+        "archive",
+        usedPexelsIds,
+        usedPixabayIds,
+        usedFileUrls,
+      );
+      console.log("[stock] Archive.org video clip selected", {
+        keyword: visualKeyword,
+        url: archivePick.url,
+        identifier: archivePick.id,
+        title: archivePick.title,
+      });
+      return buildStockResult(
+        archivePick,
+        "archive",
+        visualKeyword,
+        visualKeyword,
+        neededDuration,
+      );
+    }
+  } catch (error) {
+    console.warn("[stock] Archive.org search failed", {
+      keyword: visualKeyword,
+      message: getErrorMessage(error),
+    });
+  }
+
   return null;
 }
 
@@ -433,7 +626,10 @@ export async function fetchStockVideo(visualKeyword, options = {}) {
 
   for (const query of queriesToTry) {
     const result = await fetchStockVideoForKeyword(query, stockOptions);
-    if (result?.file_url && isValidMp4Url(result.file_url)) {
+    const isAcceptable =
+      result?.file_url &&
+      (isValidMp4Url(result.file_url) || result.source === "archive");
+    if (isAcceptable) {
       if (query !== visualKeyword.trim()) {
         console.log("[stock] Used alternate search query", {
           original: visualKeyword,
@@ -445,6 +641,6 @@ export async function fetchStockVideo(visualKeyword, options = {}) {
   }
 
   throw new Error(
-    `No unused MP4 stock video found for keyword: ${visualKeyword} (tried ${queriesToTry.length} queries)`,
+    `No unused stock video found for keyword: ${visualKeyword} (tried ${queriesToTry.length} queries)`,
   );
 }
