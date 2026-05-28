@@ -473,6 +473,38 @@ async function fetchStockVideoForKeyword(visualKeyword, options) {
   const usedFileUrls = options.usedFileUrls ?? new Set();
   const neededDuration = options.neededDuration ?? 10;
 
+  // TEMPORARY: Archive.org is the primary source (tried before Pexels/Pixabay).
+  try {
+    const archivePick = await fetchArchiveOrgClip(visualKeyword, usedFileUrls);
+    if (archivePick) {
+      markStockAsUsed(
+        archivePick,
+        "archive",
+        usedPexelsIds,
+        usedPixabayIds,
+        usedFileUrls,
+      );
+      console.log("[stock] Archive.org video clip selected", {
+        keyword: visualKeyword,
+        url: archivePick.url,
+        identifier: archivePick.id,
+        title: archivePick.title,
+      });
+      return buildStockResult(
+        archivePick,
+        "archive",
+        visualKeyword,
+        visualKeyword,
+        neededDuration,
+      );
+    }
+  } catch (error) {
+    console.warn("[stock] Archive.org search failed", {
+      keyword: visualKeyword,
+      message: getErrorMessage(error),
+    });
+  }
+
   try {
     const pexelsPick = await searchPexelsVideos(
       visualKeyword,
@@ -539,37 +571,6 @@ async function fetchStockVideoForKeyword(visualKeyword, options) {
     }
   } catch (error) {
     console.warn("[stock] Pixabay video search failed", {
-      keyword: visualKeyword,
-      message: getErrorMessage(error),
-    });
-  }
-
-  try {
-    const archivePick = await fetchArchiveOrgClip(visualKeyword, usedFileUrls);
-    if (archivePick) {
-      markStockAsUsed(
-        archivePick,
-        "archive",
-        usedPexelsIds,
-        usedPixabayIds,
-        usedFileUrls,
-      );
-      console.log("[stock] Archive.org video clip selected", {
-        keyword: visualKeyword,
-        url: archivePick.url,
-        identifier: archivePick.id,
-        title: archivePick.title,
-      });
-      return buildStockResult(
-        archivePick,
-        "archive",
-        visualKeyword,
-        visualKeyword,
-        neededDuration,
-      );
-    }
-  } catch (error) {
-    console.warn("[stock] Archive.org search failed", {
       keyword: visualKeyword,
       message: getErrorMessage(error),
     });
