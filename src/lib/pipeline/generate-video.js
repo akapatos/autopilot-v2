@@ -153,7 +153,7 @@ async function updateVideo(supabase, videoId, patch) {
   }
 }
 
-async function callAssembleEndpoint(clips, videoId) {
+async function callAssembleEndpoint(clips, videoId, niche) {
   const assemblyBase = process.env.ASSEMBLY_SERVER_URL?.replace(/\/$/, "");
   if (!assemblyBase) {
     throw new Error(
@@ -175,10 +175,12 @@ async function callAssembleEndpoint(clips, videoId) {
     body: JSON.stringify({
       clips,
       videoId,
+      niche: niche ?? null,
       cloudinaryConfig: {
         cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
         api_key: process.env.CLOUDINARY_API_KEY,
         api_secret: process.env.CLOUDINARY_API_SECRET,
+        pixabayApiKey: process.env.PIXABAY_API_KEY ?? null,
       },
     }),
   });
@@ -324,7 +326,7 @@ export async function runVideoGenerationPipeline({
       generation_stage: GENERATION_STAGES.ASSEMBLY,
     });
 
-    const assembleResult = await callAssembleEndpoint(clips, videoId);
+    const assembleResult = await callAssembleEndpoint(clips, videoId, niche);
 
     await updateVideo(supabase, videoId, {
       file_url: assembleResult.file_url,
