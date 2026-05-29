@@ -37,6 +37,24 @@ const VALID_COMPOSITION_TYPES = new Set([
   "stock",
 ]);
 
+const VALID_FOOTAGE_STRATEGIES = new Set([
+  "archive",
+  "stock",
+  "image_zoom",
+]);
+
+function sanitizeFootageStrategy(rawStrategy) {
+  const s = String(rawStrategy || "")
+    .toLowerCase()
+    .trim()
+    .replace(/-/g, "_");
+
+  if (VALID_FOOTAGE_STRATEGIES.has(s)) {
+    return s;
+  }
+  return "stock";
+}
+
 /**
  * Niche-specific writing notes for the system prompt.
  */
@@ -185,14 +203,27 @@ function sanitizeScene(scene, sceneIndex, videoMeta) {
     compositionProps = null;
   }
 
+  const footageStrategy = sanitizeFootageStrategy(
+    scene.footageStrategy || scene.footage_strategy,
+  );
+
+  const visualKeyword = String(
+    scene.visualKeyword || scene.visual_keyword || "",
+  ).trim();
+  const searchQuery =
+    String(scene.searchQuery || scene.search_query || "").trim() ||
+    visualKeyword;
+
   return {
     narration: String(scene.narration || "").trim(),
-    visualKeyword: String(scene.visualKeyword || scene.visual_keyword || "").trim(),
+    visualKeyword,
     visualDescription: String(
       scene.visualDescription || scene.visual_description || "",
     ).trim(),
     visualMood: mood,
     cameraStyle: cam,
+    footageStrategy,
+    searchQuery,
     compositionType,
     compositionProps,
     duration: durationFromWordCount(
@@ -229,6 +260,8 @@ function sanitizeTagList(tags, topic, niche) {
  *     visualDescription: string,
  *     visualMood: string,
  *     cameraStyle: string,
+ *     footageStrategy: "archive" | "stock" | "image_zoom",
+ *     searchQuery: string,
  *     productionNotes: string,
  *     duration: number,
  *     compositionType: "animated-map" | "timeline" | "data-chart" | "title-card" | "lower-third" | "stock",
@@ -283,6 +316,18 @@ DOCUMENTARY CRAFT (MANDATORY)
    • Include subject + setting + action or era when relevant. Minimum 4–6 specific words per keyword.
    • Each scene MUST use a DIFFERENT visualKeyword from every other scene (no reuse).
 
+7b) FOOTAGE STRATEGY (CRITICAL — how we source the footage). Output footageStrategy as EXACTLY one of:
+   • "archive" — the scene mentions a SPECIFIC historical person, event, battle, place, or era that likely has real archival film/newsreel footage (e.g. WW2, moon landing, a named war, a historical speech). We pull from Archive.org.
+   • "image_zoom" — the scene centers on a SPECIFIC NAMED person or specific object that most likely only exists as a PHOTOGRAPH, not video (e.g. Adolf Hitler, Albert Einstein, a specific WW1 plane, an artifact). We find/generate a still image and apply a Ken Burns zoom.
+   • "stock" — DEFAULT for generic visuals: nature, cities, crowds, modern technology, abstract concepts. We pull from Pexels/Pixabay.
+
+7c) SEARCH QUERY (CRITICAL): Output searchQuery — a highly specific phrase you believe will find the EXACT footage/image for this scene. Examples:
+   • "Adolf Hitler speech 1939 newsreel"
+   • "WW2 Battle of Britain RAF Spitfire footage"
+   • "Albert Einstein walking Princeton 1940s"
+   • "New York City timelapse traffic night aerial" (stock)
+   The searchQuery should reflect the footageStrategy (archival phrasing for archive, person/object name + era for image_zoom, descriptive scene for stock).
+
 8) DURATION (CRITICAL — you control clip timing):
    • Each scene's duration must EXACTLY match how long the narration takes to speak at 130 words per minute.
    • Calculate: duration_seconds = (word_count / 130) * 60 — round to one decimal.
@@ -309,6 +354,8 @@ OUTPUT FORMAT — Return ONLY valid JSON (no markdown, no prose outside JSON):
     {
       "narration": "2-4 spoken sentences ending on a hook. No labels like 'Voice:'",
       "visualKeyword": "4-8 highly specific search words matching THIS scene's narration exactly",
+      "footageStrategy": "archive | stock | image_zoom",
+      "searchQuery": "highly specific phrase to find the exact footage/image (e.g. 'Adolf Hitler speech 1939 newsreel')",
       "visualDescription": "One or two vivid sentences stating exactly what the viewer should SEE (composition, era, subjects, motion, time of day if relevant)",
       "visualMood": "one word: dramatic | calm | tense | uplifting | mysterious | shocking",
       "cameraStyle": "exactly one of: wide | closeup | aerial | tracking | static",
@@ -333,6 +380,7 @@ FINAL CHECK before you output JSON:
 • Every scene.duration === round((word_count/130)*60, 1) from its narration (never estimated).
 • Sum(scene.duration) ≈ ${targetSeconds} (±5% acceptable).
 • No two scenes share the same visualKeyword.
+• Every scene has footageStrategy (archive | stock | image_zoom) and a specific searchQuery.
 • No two consecutive scenes start with identical first words.
 • First scene honours the HOOK principle and uses compositionType "title-card".
 `;
@@ -385,10 +433,13 @@ FINAL CHECK before you output JSON:
     sceneCount: scenes.length,
     targetSeconds,
     compositionTypes: scenes.map((s) => s.compositionType),
+    footageStrategies: scenes.map((s) => s.footageStrategy),
     durationsSample: scenes.slice(0, 3).map((s) => ({
       wc: wordCount(s.narration),
       duration: s.duration,
       compositionType: s.compositionType,
+      footageStrategy: s.footageStrategy,
+      searchQuery: s.searchQuery,
     })),
   });
   const description = String(parsed.description || "").trim();

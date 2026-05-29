@@ -30,15 +30,19 @@ function buildClipFromStock(scene, stock) {
     visual_description: scene.visualDescription ?? null,
     visual_mood: scene.visualMood ?? null,
     camera_style: scene.cameraStyle ?? null,
+    footage_strategy: scene.footageStrategy ?? "stock",
+    search_query: scene.searchQuery ?? scene.visualKeyword,
     composition_type: scene.compositionType ?? "stock",
     composition_props: scene.compositionProps ?? null,
     remotion_composition_id: null,
+    needs_ken_burns: stock.needs_ken_burns === true,
     script_duration: scene.duration,
     duration: stock.duration ?? scene.duration,
     trim_start: stock.trim_start ?? 0,
     trim_end: stock.trim_end ?? scene.duration,
     source: stock.source,
     pexels_id: stock.pexels_id ?? null,
+    archive_id: stock.archive_id ?? null,
     stock_duration: stock.stock_duration ?? null,
     voice_url: null,
     voice_duration: null,
@@ -58,6 +62,9 @@ async function fetchFootageForScene(
     usedPixabayIds,
     usedFileUrls,
     neededDuration: scene.duration,
+    footageStrategy: scene.footageStrategy ?? "stock",
+    searchQuery: scene.searchQuery ?? scene.visualKeyword,
+    openaiApiKey: process.env.OPENAI_API_KEY,
   };
 
   if (!isMotionGraphicScene(scene)) {
@@ -181,6 +188,7 @@ async function callAssembleEndpoint(clips, videoId, niche) {
         api_key: process.env.CLOUDINARY_API_KEY,
         api_secret: process.env.CLOUDINARY_API_SECRET,
         pixabayApiKey: process.env.PIXABAY_API_KEY ?? null,
+        openaiApiKey: process.env.OPENAI_API_KEY ?? null,
       },
     }),
   });

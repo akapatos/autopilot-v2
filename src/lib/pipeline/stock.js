@@ -1,4 +1,6 @@
 import axios from "axios";
+import { v2 as cloudinary } from "cloudinary";
+import OpenAI from "openai";
 import { getErrorMessage } from "@/lib/pipeline/error-message";
 
 const PEXELS_VIDEOS_SEARCH_URL = "https://api.pexels.com/videos/search";
@@ -12,8 +14,25 @@ const ARCHIVE_RESULT_LIMIT = 10;
 const ARCHIVE_MAX_FILE_BYTES = 100 * 1024 * 1024;
 /** Preferred Archive.org video extensions, in priority order. */
 const ARCHIVE_VIDEO_EXTENSIONS = [".mp4", ".mpeg", ".mpg", ".avi"];
+/** Preferred Archive.org image extensions, in priority order. */
+const ARCHIVE_IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png"];
+const OPENAI_IMAGE_MODEL = "gpt-image-1";
 
 const QUERY_MODIFIERS = ["cinematic", "aerial", "close up", "documentary"];
+
+let cloudinaryConfigured = false;
+function ensureCloudinaryConfigured() {
+  if (cloudinaryConfigured) {
+    return;
+  }
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+    secure: true,
+  });
+  cloudinaryConfigured = true;
+}
 
 const IMAGE_EXT_PATTERN = /\.(jpe?g|png|gif|webp|bmp|svg|avif)(\?|$)/i;
 
@@ -228,23 +247,33 @@ export function computeRandomTrimStart(stockDurationSec, voiceDurationSec) {
   return Math.round(start * 1000) / 1000;
 }
 
-function buildStockResult(pick, source, visualKeyword, searchKeyword, voiceDuration) {
+function buildStockResult(
+  pick,
+  source,
+  visualKeyword,
+  searchKeyword,
+  voiceDuration,
+  extra = {},
+) {
   const duration = Math.max(0.1, Number(voiceDuration) || 10);
   const trim_start = computeRandomTrimStart(pick.duration, duration);
+  const isArchiveSource = source === "archive" || source === "archive_image";
 
   return {
     file_url: pick.url,
     source,
     pexels_id: source === "pexels" ? (pick.id ?? null) : null,
     pixabay_id: source === "pixabay" ? (pick.id ?? null) : null,
-    archive_id: source === "archive" ? (pick.id ?? null) : null,
-    archive_title: source === "archive" ? (pick.title ?? null) : null,
+    archive_id: isArchiveSource ? (pick.id ?? null) : null,
+    archive_title: isArchiveSource ? (pick.title ?? null) : null,
     stock_duration: pick.duration,
     trim_start,
     trim_end: duration,
     duration,
     search_keyword: searchKeyword,
     matched_keyword: visualKeyword,
+    needs_ken_burns: false,
+    ...extra,
   };
 }
 
@@ -467,116 +496,380 @@ export async function fetchArchiveOrgClip(visualKeyword, usedFileUrls = new Set(
   return null;
 }
 
-async function fetchStockVideoForKeyword(visualKeyword, options) {
-  const usedPexelsIds = options.usedPexelsIds ?? new Set();
-  const usedPixabayIds = options.usedPixabayIds ?? new Set();
-  const usedFileUrls = options.usedFileUrls ?? new Set();
-  const neededDuration = options.neededDuration ?? 10;
+/**
+ * Pick the best still image file from an Archive.org metadata file list.
+ * Prefer .jpg → .jpeg → .png, prefer files under 100MB.
+ */
+function pickBestArchiveImageFile(files) {
+  if (!Array.isArray(files)) {
+    return null;
+  }
 
-  // TEMPORARY: Archive.org is the primary source (tried before Pexels/Pixabay).
+  const rankExt = (name) => {
+    const lower = String(name || "").toLowerCase();
+    for (let i = 0; i < ARCHIVE_IMAGE_EXTENSIONS.length; i++) {
+      if (lower.endsWith(ARCHIVE_IMAGE_EXTENSIONS[i])) {
+        return i;
+      }
+    }
+    return -1;
+  };
+
+  const candidates = files
+    .filter((file) => file?.name && rankExt(file.name) >= 0)
+    // Archive.org generates tiny thumbnails (e.g. *_thumb.jpg); skip those.
+    .filter((file) => !/(thumb|__ia_thumb|_itemimage)/i.test(file.name))
+    .map((file) => {
+      const size = Number(file.size) || 0;
+      return {
+        name: file.name,
+        size,
+        extRank: rankExt(file.name),
+        underLimit: size > 0 && size <= ARCHIVE_MAX_FILE_BYTES,
+      };
+    });
+
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  candidates.sort((a, b) => {
+    if (a.underLimit !== b.underLimit) {
+      return a.underLimit ? -1 : 1;
+    }
+    if (a.extRank !== b.extRank) {
+      return a.extRank - b.extRank;
+    }
+    // Prefer larger (higher-quality) images for Ken Burns.
+    return (b.size || 0) - (a.size || 0);
+  });
+
+  return candidates[0];
+}
+
+/**
+ * Search Archive.org for a still image and resolve a direct image file URL.
+ * @returns {Promise<{ url: string, id: string, title: string, duration: null } | null>}
+ */
+async function fetchArchiveOrgImage(visualKeyword, usedFileUrls = new Set()) {
+  const query = String(visualKeyword || "").trim();
+  if (!query) {
+    return null;
+  }
+
+  console.log("[stock] Archive.org image search", {
+    endpoint: ARCHIVE_SEARCH_URL,
+    keyword: query,
+  });
+
+  const searchRes = await axios.get(ARCHIVE_SEARCH_URL, {
+    params: {
+      q: query,
+      mediatype: "image",
+      "fl[]": ["identifier", "title", "description"],
+      rows: ARCHIVE_RESULT_LIMIT,
+      output: "json",
+    },
+    timeout: 30000,
+  });
+
+  const docs = searchRes.data?.response?.docs;
+  if (!Array.isArray(docs) || docs.length === 0) {
+    console.log("[stock] Archive.org no image results", { keyword: query });
+    return null;
+  }
+
+  for (const doc of docs) {
+    const identifier = doc?.identifier;
+    if (!identifier) {
+      continue;
+    }
+
+    let metadata;
+    try {
+      const metaRes = await axios.get(`${ARCHIVE_METADATA_URL}/${identifier}`, {
+        timeout: 30000,
+      });
+      metadata = metaRes.data;
+    } catch (error) {
+      console.warn("[stock] Archive.org image metadata fetch failed", {
+        identifier,
+        message: getErrorMessage(error),
+      });
+      continue;
+    }
+
+    const best = pickBestArchiveImageFile(metadata?.files);
+    if (!best) {
+      continue;
+    }
+
+    const server = metadata?.server;
+    const dir = metadata?.dir;
+    const fileUrl =
+      server && dir
+        ? `https://${server}${dir}/${encodeURIComponent(best.name)}`
+        : `https://archive.org/download/${identifier}/${encodeURIComponent(best.name)}`;
+
+    if (usedFileUrls.has(fileUrl)) {
+      console.log("[stock] Skipping duplicate Archive.org image URL", { identifier });
+      continue;
+    }
+
+    const title = String(doc?.title || metadata?.metadata?.title || identifier);
+
+    console.log("[stock] Archive.org image found", {
+      identifier,
+      title,
+      file: best.name,
+      url: fileUrl,
+    });
+
+    return { url: fileUrl, id: identifier, title, duration: null };
+  }
+
+  console.log("[stock] Archive.org no image results", {
+    keyword: query,
+    reason: "no usable image files in metadata",
+  });
+  return null;
+}
+
+/**
+ * Generate an image of the subject with OpenAI gpt-image-1 and host it on Cloudinary.
+ * @returns {Promise<{ url: string, id: string, title: string, duration: null } | null>}
+ */
+async function generateOpenAiImage(subject, apiKey) {
+  const cleanSubject = String(subject || "").trim();
+  if (!cleanSubject) {
+    return null;
+  }
+
+  console.log("[stock] Generating image with OpenAI gpt-image-1", {
+    subject: cleanSubject,
+  });
+
+  const client = new OpenAI({ apiKey });
+  const prompt = `Photorealistic, historically accurate documentary photograph of ${cleanSubject}. Cinematic lighting, high detail, period-accurate. No text, captions, watermarks, or borders.`;
+
+  const result = await client.images.generate({
+    model: OPENAI_IMAGE_MODEL,
+    prompt,
+    size: "1536x1024",
+    n: 1,
+  });
+
+  const b64 = result?.data?.[0]?.b64_json;
+  if (!b64) {
+    console.log("[stock] OpenAI image generation returned no data", {
+      subject: cleanSubject,
+    });
+    return null;
+  }
+
+  ensureCloudinaryConfigured();
+  const upload = await cloudinary.uploader.upload(
+    `data:image/png;base64,${b64}`,
+    {
+      resource_type: "image",
+      folder: "autopilot/generated",
+      overwrite: false,
+      timeout: 120000,
+    },
+  );
+
+  console.log("[stock] OpenAI image uploaded to Cloudinary", {
+    subject: cleanSubject,
+    url: upload.secure_url,
+  });
+
+  return {
+    url: upload.secure_url,
+    id: upload.public_id,
+    title: cleanSubject,
+    duration: null,
+  };
+}
+
+async function tryArchiveVideo(query, sets, neededDuration) {
   try {
-    const archivePick = await fetchArchiveOrgClip(visualKeyword, usedFileUrls);
-    if (archivePick) {
+    const pick = await fetchArchiveOrgClip(query, sets.usedFileUrls);
+    if (pick) {
       markStockAsUsed(
-        archivePick,
+        pick,
         "archive",
-        usedPexelsIds,
-        usedPixabayIds,
-        usedFileUrls,
+        sets.usedPexelsIds,
+        sets.usedPixabayIds,
+        sets.usedFileUrls,
       );
       console.log("[stock] Archive.org video clip selected", {
-        keyword: visualKeyword,
-        url: archivePick.url,
-        identifier: archivePick.id,
-        title: archivePick.title,
+        keyword: query,
+        url: pick.url,
+        identifier: pick.id,
+        title: pick.title,
       });
-      return buildStockResult(
-        archivePick,
-        "archive",
-        visualKeyword,
-        visualKeyword,
-        neededDuration,
-      );
+      return buildStockResult(pick, "archive", query, query, neededDuration);
     }
   } catch (error) {
     console.warn("[stock] Archive.org search failed", {
-      keyword: visualKeyword,
+      keyword: query,
       message: getErrorMessage(error),
     });
   }
+  return null;
+}
 
+async function tryPexels(query, sets, neededDuration) {
   try {
-    const pexelsPick = await searchPexelsVideos(
-      visualKeyword,
-      usedPexelsIds,
-      usedFileUrls,
-    );
-    if (pexelsPick) {
+    const pick = await searchPexelsVideos(query, sets.usedPexelsIds, sets.usedFileUrls);
+    if (pick) {
       markStockAsUsed(
-        pexelsPick,
+        pick,
         "pexels",
-        usedPexelsIds,
-        usedPixabayIds,
-        usedFileUrls,
+        sets.usedPexelsIds,
+        sets.usedPixabayIds,
+        sets.usedFileUrls,
       );
       console.log("[stock] Pexels video clip selected", {
-        keyword: visualKeyword,
-        url: pexelsPick.url,
-        pexels_id: pexelsPick.id,
-        height: pexelsPick.height,
-        usedPexelsCount: usedPexelsIds.size,
+        keyword: query,
+        url: pick.url,
+        pexels_id: pick.id,
+        height: pick.height,
+        usedPexelsCount: sets.usedPexelsIds.size,
       });
-      return buildStockResult(
-        pexelsPick,
-        "pexels",
-        visualKeyword,
-        visualKeyword,
-        neededDuration,
-      );
+      return buildStockResult(pick, "pexels", query, query, neededDuration);
     }
   } catch (error) {
     console.warn("[stock] Pexels video search failed", {
-      keyword: visualKeyword,
+      keyword: query,
+      message: getErrorMessage(error),
+    });
+  }
+  return null;
+}
+
+async function tryPixabay(query, sets, neededDuration) {
+  try {
+    const pick = await searchPixabayVideos(query, sets.usedPixabayIds, sets.usedFileUrls);
+    if (pick) {
+      markStockAsUsed(
+        pick,
+        "pixabay",
+        sets.usedPexelsIds,
+        sets.usedPixabayIds,
+        sets.usedFileUrls,
+      );
+      console.log("[stock] Pixabay video clip selected", {
+        keyword: query,
+        url: pick.url,
+        pixabay_id: pick.id,
+        usedPixabayCount: sets.usedPixabayIds.size,
+      });
+      return buildStockResult(pick, "pixabay", query, query, neededDuration);
+    }
+  } catch (error) {
+    console.warn("[stock] Pixabay video search failed", {
+      keyword: query,
+      message: getErrorMessage(error),
+    });
+  }
+  return null;
+}
+
+/**
+ * image_zoom: find a still image (Archive.org first, then OpenAI generation),
+ * flagged needs_ken_burns so the assembler applies a Ken Burns zoom.
+ */
+async function tryImageZoom(query, options, sets, neededDuration) {
+  try {
+    const imgPick = await fetchArchiveOrgImage(query, sets.usedFileUrls);
+    if (imgPick) {
+      markStockAsUsed(
+        imgPick,
+        "archive_image",
+        sets.usedPexelsIds,
+        sets.usedPixabayIds,
+        sets.usedFileUrls,
+      );
+      console.log("[stock] Archive.org image selected (Ken Burns)", {
+        keyword: query,
+        url: imgPick.url,
+        identifier: imgPick.id,
+      });
+      return buildStockResult(imgPick, "archive_image", query, query, neededDuration, {
+        needs_ken_burns: true,
+      });
+    }
+  } catch (error) {
+    console.warn("[stock] Archive.org image search failed", {
+      keyword: query,
       message: getErrorMessage(error),
     });
   }
 
+  const apiKey = options.openaiApiKey || process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    console.warn("[stock] No OpenAI API key — cannot generate image_zoom image", {
+      keyword: query,
+    });
+    return null;
+  }
+
   try {
-    const pixabayPick = await searchPixabayVideos(
-      visualKeyword,
-      usedPixabayIds,
-      usedFileUrls,
-    );
-    if (pixabayPick) {
-      markStockAsUsed(
-        pixabayPick,
-        "pixabay",
-        usedPexelsIds,
-        usedPixabayIds,
-        usedFileUrls,
-      );
-      console.log("[stock] Pixabay video clip selected", {
-        keyword: visualKeyword,
-        url: pixabayPick.url,
-        pixabay_id: pixabayPick.id,
-        usedPixabayCount: usedPixabayIds.size,
+    const gen = await generateOpenAiImage(query, apiKey);
+    if (gen) {
+      sets.usedFileUrls.add(gen.url);
+      return buildStockResult(gen, "openai", query, query, neededDuration, {
+        needs_ken_burns: true,
       });
-      return buildStockResult(
-        pixabayPick,
-        "pixabay",
-        visualKeyword,
-        visualKeyword,
-        neededDuration,
-      );
     }
   } catch (error) {
-    console.warn("[stock] Pixabay video search failed", {
-      keyword: visualKeyword,
+    console.warn("[stock] OpenAI image generation failed", {
+      keyword: query,
       message: getErrorMessage(error),
     });
   }
 
   return null;
+}
+
+async function fetchStockVideoForKeyword(visualKeyword, options) {
+  const sets = {
+    usedPexelsIds: options.usedPexelsIds ?? new Set(),
+    usedPixabayIds: options.usedPixabayIds ?? new Set(),
+    usedFileUrls: options.usedFileUrls ?? new Set(),
+  };
+  const neededDuration = options.neededDuration ?? 10;
+  const strategy = options.footageStrategy ?? "stock";
+
+  // "image_zoom" → still image (Archive.org image, else OpenAI), then video fallbacks.
+  if (strategy === "image_zoom") {
+    const imageResult = await tryImageZoom(visualKeyword, options, sets, neededDuration);
+    if (imageResult) {
+      return imageResult;
+    }
+    return (
+      (await tryArchiveVideo(visualKeyword, sets, neededDuration)) ||
+      (await tryPexels(visualKeyword, sets, neededDuration)) ||
+      (await tryPixabay(visualKeyword, sets, neededDuration))
+    );
+  }
+
+  // "archive" → Archive.org first, then Pexels, then Pixabay.
+  if (strategy === "archive") {
+    return (
+      (await tryArchiveVideo(visualKeyword, sets, neededDuration)) ||
+      (await tryPexels(visualKeyword, sets, neededDuration)) ||
+      (await tryPixabay(visualKeyword, sets, neededDuration))
+    );
+  }
+
+  // "stock" (default) → Pexels first, then Pixabay, then Archive.org.
+  return (
+    (await tryPexels(visualKeyword, sets, neededDuration)) ||
+    (await tryPixabay(visualKeyword, sets, neededDuration)) ||
+    (await tryArchiveVideo(visualKeyword, sets, neededDuration))
+  );
 }
 
 function buildQueriesForKeyword(keyword) {
@@ -590,6 +883,20 @@ function buildQueriesForKeyword(keyword) {
   return [...new Set(queries)];
 }
 
+function isAcceptableFootageResult(result) {
+  if (!result?.file_url) {
+    return false;
+  }
+  // Image (Ken Burns) and Archive.org results bypass the MP4-only gate.
+  if (result.needs_ken_burns === true) {
+    return true;
+  }
+  if (result.source === "archive") {
+    return true;
+  }
+  return isValidMp4Url(result.file_url);
+}
+
 /**
  * @param {string} visualKeyword
  * @param {{
@@ -597,14 +904,20 @@ function buildQueriesForKeyword(keyword) {
  *   usedPixabayIds?: Set<number>,
  *   usedFileUrls?: Set<string>,
  *   neededDuration?: number,
+ *   footageStrategy?: "archive" | "stock" | "image_zoom",
+ *   searchQuery?: string,
+ *   openaiApiKey?: string,
  * }} options
  */
 export async function fetchStockVideo(visualKeyword, options = {}) {
   const usedPexelsIds = options.usedPexelsIds ?? new Set();
   const usedPixabayIds = options.usedPixabayIds ?? new Set();
   const usedFileUrls = options.usedFileUrls ?? new Set();
+  const footageStrategy = options.footageStrategy ?? "stock";
+  const searchQuery = String(options.searchQuery || "").trim();
   const stockOptions = {
     ...options,
+    footageStrategy,
     usedPexelsIds,
     usedPixabayIds,
     usedFileUrls,
@@ -613,25 +926,29 @@ export async function fetchStockVideo(visualKeyword, options = {}) {
   const baseKeywords = getSearchKeywords(visualKeyword);
   const queriesToTry = [];
 
+  // Claude's specific searchQuery takes priority over the generic keyword.
+  if (searchQuery) {
+    queriesToTry.push(searchQuery);
+  }
   for (const base of baseKeywords) {
     queriesToTry.push(...buildQueriesForKeyword(base));
   }
+  const dedupedQueries = [...new Set(queriesToTry.filter(Boolean))];
 
-  console.log("[stock] Fetching stock video (MP4 only)", {
+  console.log("[stock] Fetching footage", {
     visualKeyword,
-    queriesToTry,
+    footageStrategy,
+    searchQuery,
+    queriesToTry: dedupedQueries,
     usedPexelsCount: usedPexelsIds.size,
     usedPixabayCount: usedPixabayIds.size,
     usedUrlCount: usedFileUrls.size,
   });
 
-  for (const query of queriesToTry) {
+  for (const query of dedupedQueries) {
     const result = await fetchStockVideoForKeyword(query, stockOptions);
-    const isAcceptable =
-      result?.file_url &&
-      (isValidMp4Url(result.file_url) || result.source === "archive");
-    if (isAcceptable) {
-      if (query !== visualKeyword.trim()) {
+    if (isAcceptableFootageResult(result)) {
+      if (query !== searchQuery && query !== visualKeyword.trim()) {
         console.log("[stock] Used alternate search query", {
           original: visualKeyword,
           query,
@@ -642,6 +959,6 @@ export async function fetchStockVideo(visualKeyword, options = {}) {
   }
 
   throw new Error(
-    `No unused stock video found for keyword: ${visualKeyword} (tried ${queriesToTry.length} queries)`,
+    `No unused footage found for keyword: ${visualKeyword} (strategy: ${footageStrategy}, tried ${dedupedQueries.length} queries)`,
   );
 }
